@@ -44,14 +44,17 @@ YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3/videos'
 
 # Column mapping from Combined Data (0-based indices)
 # Source columns in Combined Data:
-#   0: Advertiser Name
-#   1: Ads URL (Full YouTube link)
-#   2: App Link ← Filter by this (must be valid Play Store link)
-#   3: App Name
-#   4: Video ID
+#   0 (A): Advertiser Name
+#   1 (B): Ads URL
+#   2 (C): App Link ← Filter by this (must be valid Play Store link)
+#   3 (D): App Name
+#   4 (E): Video ID ← For duplicate detection
+#   5 (F): Full Youtube links
 
-# App Link column index in SOURCE data (for filtering)
-APP_LINK_COLUMN_INDEX = 2
+# Column indices
+APP_LINK_COLUMN_INDEX = 2   # Column C
+VIDEO_ID_COLUMN_INDEX = 4   # Column E
+YOUTUBE_URL_COLUMN_INDEX = 5  # Column F
 
 class DataCleaner:
     def __init__(self, credentials_json, master_sheet_id):
@@ -380,6 +383,127 @@ class DataCleaner:
         
         return cleaned_rows
     
+    def clean_data_no_youtube(self, data_rows, existing_video_ids):
+        """Filter rows to keep only valid NEW rows (NO YouTube API calls)"""
+        if not data_rows:
+            return []
+        
+        existing_video_ids = existing_video_ids or set()
+        
+        logger.info(f"Filtering {len(data_rows)} rows...")
+        logger.info(f"  Already in Clean data: {len(existing_video_ids)} Video IDs")
+        
+        valid_rows = []
+        removed_invalid = 0
+        removed_duplicate = 0
+        removed_existing = 0
+        seen_video_ids = set()
+        
+        for row in data_rows:
+            # Filter 1: Valid Play Store link in App Link column (C, index 2)
+            app_link = row[APP_LINK_COLUMN_INDEX] if len(row) > APP_LINK_COLUMN_INDEX else ''
+            
+            if not self.is_valid_playstore_link(app_link):
+                removed_invalid += 1
+                continue
+            
+            # Get Video ID from column E (index 4) - use directly for duplicate check
+            video_id = row[VIDEO_ID_COLUMN_INDEX] if len(row) > VIDEO_ID_COLUMN_INDEX else ''
+            
+            if not video_id:
+                removed_invalid += 1
+                continue
+            
+            # Filter 2: Remove duplicates (already seen in this batch)
+            if video_id in seen_video_ids:
+                removed_duplicate += 1
+                continue
+            
+            # Filter 3: Skip if already in Clean data
+            if video_id in existing_video_ids:
+                removed_existing += 1
+                continue
+            
+            # Mark this Video ID as seen
+            seen_video_ids.add(video_id)
+            
+            # Build output row (without YouTube stats - will be filled in Step 3)
+            # Output columns starting at B:
+            # B: Video ID, C: Base 64 (empty), D: Full Youtube links (leave empty as requested), 
+            # E: App Link, F: App Name, G: Advertiser Name, H: Yt Views, I: Upload Time
+            app_name = row[3] if len(row) > 3 else ''
+            advertiser = row[0] if len(row) > 0 else ''
+            
+            output_row = [
+                video_id,      # B: Video ID
+                '',            # C: Base 64 (empty)
+                '',            # D: Full Youtube links (Leave empty - Step 3 will use Video ID from B)
+                app_link,      # E: App Link
+                app_name,      # F: App Name
+                advertiser,    # G: Advertiser Name
+                '',            # H: Yt Views (empty - will be filled in Step 3)
+                ''             # I: Upload Time (empty - will be filled in Step 3)
+            ]
+            
+            valid_rows.append(output_row)
+        
+        logger.info(f"  - Total rows: {len(data_rows)}")
+        logger.info(f"  - Invalid (no valid App Link or Video ID): {removed_invalid}")
+        logger.info(f"  - Duplicate Video IDs: {removed_duplicate}")
+        logger.info(f"  - Already in Clean data: {removed_existing}")
+        logger.info(f"  - NEW rows to add: {len(valid_rows)}")
+        
+        return valid_rows
+    
+    def write_new_rows(self, data_rows, current_row_count):
+        """Write new rows to Clean data sheet (without YouTube stats)"""
+        if not data_rows:
+            return 0
+        
+        try:
+            master = self.client.open_by_key(self.master_sheet_id)
+            clean_sheet = master.worksheet('Clean data')
+            
+            # Calculate required size
+            required_rows = current_row_count + len(data_rows)
+            
+            # Resize if needed
+            if clean_sheet.row_count < required_rows:
+                clean_sheet.resize(rows=required_rows + 1000)
+                time.sleep(1)
+            
+            # Start writing after existing data
+            start_row = current_row_count + 1 if current_row_count > 1 else 2
+            
+            logger.info(f"  Writing {len(data_rows)} rows starting at B{start_row}...")
+            
+            # Write in batches
+            total_rows = len(data_rows)
+            for start_idx in range(0, total_rows, BATCH_SIZE):
+                end_idx = min(start_idx + BATCH_SIZE, total_rows)
+                batch = data_rows[start_idx:end_idx]
+                
+                sheet_row = start_row + start_idx
+                
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        # Write starting at column B (Video ID is first column in output)
+                        clean_sheet.update(values=batch, range_name=f'B{sheet_row}', value_input_option='RAW')
+                        break
+                    except Exception as e:
+                        logger.warning(f"Write attempt {attempt} failed: {e}")
+                        if attempt == MAX_RETRIES:
+                            raise
+                        time.sleep(RETRY_DELAY * attempt)
+            
+            logger.info(f"  ✓ Wrote {len(data_rows)} new rows")
+            return len(data_rows)
+            
+        except Exception as e:
+            logger.error(f"Failed to write new rows: {e}")
+            logger.debug(traceback.format_exc())
+            raise
+    
     def get_existing_video_ids(self):
         """Read existing data from Clean data sheet - Video IDs and rows missing views"""
         try:
@@ -390,30 +514,41 @@ class DataCleaner:
                 # Get all values
                 all_data = clean_sheet.get_all_values()
                 
-                # Skip header row
-                # Column D (index 3): Full Youtube links
-                # Column H (index 7): Yt Views
-                existing_video_ids = set()  # Store video IDs, not full URLs
-                rows_missing_views = []  # List of (row_number, youtube_url) that need stats
+                # Clean data columns:
+                # B (index 1): Video ID
+                # D (index 3): Full Youtube links
+                # E (index 4): App Link
+                # H (index 7): Yt Views
+                existing_video_ids = set()
+                rows_missing_views = []  # List of (row_number, video_id) that need stats
+                
+                last_data_row = 1 # Header is row 1
                 
                 for idx, row in enumerate(all_data[1:], start=2):  # Start at row 2 (skip header)
-                    youtube_url = row[3] if len(row) > 3 else ''
-                    yt_views = row[7] if len(row) > 7 else ''
+                    video_id = row[1] if len(row) > 1 else ''  # Column B
+                    youtube_url = row[3] if len(row) > 3 else ''  # Column D
+                    app_link = row[4] if len(row) > 4 else '' # Column E
+                    yt_views = row[7] if len(row) > 7 else ''  # Column H
                     
-                    if youtube_url:
-                        # Extract video ID for reliable comparison
-                        video_id = self.extract_video_id(youtube_url)
-                        if video_id:
-                            existing_video_ids.add(video_id)
+                    # Determine Video ID to use for stats (prefer B, fallback to D)
+                    vid = video_id or self.extract_video_id(youtube_url)
+                    
+                    if vid:
+                        existing_video_ids.add(vid)
                         
                         # Check if this row is missing views
                         if not yt_views or yt_views.strip() == '':
-                            rows_missing_views.append((idx, youtube_url))
+                            rows_missing_views.append((idx, vid))
+                    
+                    # Update last non-empty row tracking (check B and E)
+                    if (video_id and video_id.strip()) or (app_link and app_link.strip()):
+                        last_data_row = idx
                 
                 logger.info(f"✓ Found {len(existing_video_ids)} existing Video IDs in Clean data")
                 logger.info(f"  - Rows missing views: {len(rows_missing_views)}")
+                logger.info(f"  - Last row with data: {last_data_row}")
                 
-                return existing_video_ids, len(all_data), rows_missing_views
+                return existing_video_ids, last_data_row, rows_missing_views
                 
             except gspread.WorksheetNotFound:
                 logger.info("Clean data sheet not found, will create new one")
@@ -432,12 +567,11 @@ class DataCleaner:
         
         logger.info(f"Updating {len(rows_missing_views)} rows with missing views...")
         
-        # Extract video IDs from URLs
+        # Prepare batch updates
         video_ids_to_fetch = []
         row_video_map = {}  # video_id -> list of row numbers
         
-        for row_num, youtube_url in rows_missing_views:
-            video_id = self.extract_video_id(youtube_url)
+        for row_num, video_id in rows_missing_views:
             if video_id:
                 video_ids_to_fetch.append(video_id)
                 if video_id not in row_video_map:
@@ -462,8 +596,7 @@ class DataCleaner:
             
             # Prepare batch updates
             updates = []
-            for row_num, youtube_url in rows_missing_views:
-                video_id = self.extract_video_id(youtube_url)
+            for row_num, video_id in rows_missing_views:
                 if video_id and video_id in self.youtube_cache:
                     view_count, time_ago = self.youtube_cache[video_id]
                     # Column H (views) = column 8, Column I (time) = column 9
@@ -589,50 +722,59 @@ class DataCleaner:
         logger.info("=" * 60)
         
         try:
-            # Step 1: Get existing data from Clean data sheet
-            logger.info("Step 1: Reading existing data from Clean data sheet...")
-            existing_urls, current_row_count, rows_missing_views = self.get_existing_video_ids()
+            # ============================================
+            # STEP 1: Read Combined Data and filter NEW rows
+            # ============================================
+            logger.info("Step 1: Reading and filtering Combined Data...")
             
-            # Step 2: Update existing rows that are missing views
-            updated_count = 0
-            if rows_missing_views:
-                logger.info("Step 2: Updating existing rows with missing views...")
-                updated_count = self.update_missing_views(rows_missing_views)
-            else:
-                logger.info("Step 2: No existing rows missing views - skipping update")
+            # Read existing Video IDs from Clean data
+            existing_video_ids, current_row_count, _ = self.get_existing_video_ids()
             
-            # Step 3: Read from Combined Data
-            logger.info("Step 3: Reading from Combined Data sheet...")
+            # Read Combined Data
             data_rows = self.read_combined_data()
             
             if not data_rows:
                 logger.warning("No data in Combined Data. Exiting.")
-                elapsed = time.time() - start_time
-                logger.info(f"✓ Done! Updated {updated_count} existing rows. Time: {elapsed:.1f}s")
                 return
             
-            # Step 4: Clean the data, fetch YouTube stats for NEW rows only
-            logger.info("Step 4: Cleaning data and fetching YouTube stats for new rows...")
-            cleaned_rows = self.clean_data(data_rows, existing_urls)
+            # Filter to get only NEW valid rows (without YouTube API calls)
+            cleaned_rows = self.clean_data_no_youtube(data_rows, existing_video_ids)
             
+            # ============================================
+            # STEP 2: Write NEW rows to Clean data (no YouTube stats yet)
+            # ============================================
             new_count = 0
             if cleaned_rows:
-                # Step 5: Append only NEW data to Clean data tab
-                logger.info("Step 5: Appending new data to Clean data sheet...")
-                new_count = self.write_to_clean_data(cleaned_rows, existing_urls, current_row_count)
+                logger.info(f"Step 2: Writing {len(cleaned_rows)} new rows to Clean data...")
+                new_count = self.write_new_rows(cleaned_rows, current_row_count)
             else:
-                logger.info("Step 5: No new rows to add - all data already exists")
+                logger.info("Step 2: No new rows to add - all data already exists")
+            
+            # ============================================
+            # STEP 3: Update ALL rows missing YouTube views
+            # ============================================
+            logger.info("Step 3: Checking for rows missing YouTube views...")
+            
+            # Re-read Clean data to get rows missing views (includes newly added rows)
+            _, _, rows_missing_views = self.get_existing_video_ids()
+            
+            updated_count = 0
+            if rows_missing_views:
+                logger.info(f"Found {len(rows_missing_views)} rows missing views. Fetching YouTube stats...")
+                updated_count = self.update_missing_views(rows_missing_views)
+            else:
+                logger.info("All rows have YouTube views - nothing to update")
             
             # Summary
             elapsed = time.time() - start_time
-            api_calls = ((len(rows_missing_views) + 49) // 50) + ((new_count + 49) // 50) if new_count > 0 else (len(rows_missing_views) + 49) // 50
+            api_calls = (len(rows_missing_views) + 49) // 50 if rows_missing_views else 0
             
             logger.info("=" * 60)
             logger.info(f"✓ SUCCESS!")
             logger.info(f"  Combined Data rows: {len(data_rows)}")
-            logger.info(f"  Already in Clean data: {len(existing_urls)}")
-            logger.info(f"  Existing rows updated (missing views): {updated_count}")
+            logger.info(f"  Already in Clean data: {len(existing_video_ids)}")
             logger.info(f"  NEW rows added: {new_count}")
+            logger.info(f"  Rows updated with YouTube stats: {updated_count}")
             logger.info(f"  Time elapsed: {elapsed:.1f} seconds")
             logger.info(f"  YouTube API quota used: ~{api_calls} units")
             logger.info("=" * 60)
