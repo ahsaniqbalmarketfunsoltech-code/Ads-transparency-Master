@@ -117,59 +117,71 @@ class DataCleaner:
             raise
     
     def clean_data(self, data_rows):
-        """Filter rows to keep only those with valid Play Store links, and map to output columns"""
+        """Filter rows to keep only those with valid Play Store links, remove duplicate Video IDs, and map to output columns"""
         if not data_rows:
             return []
         
         logger.info(f"Cleaning {len(data_rows)} rows...")
         
-        # Output column mapping (0-based, starting from column B):
+        # Output column mapping (starting from column B):
         # Clean data headers:
-        #   A: Youtube Temp (skip - we start at B)
         #   B: Video ID      → output position 0
-        #   C: (empty)       → output position 1 (empty)
-        #   D: Base 64       → output position 2 (empty)
-        #   E: Full Youtube  → output position 3 (empty)
-        #   F: App Link      → output position 4
-        #   G: App Name      → output position 5
-        #   H: Advertiser    → output position 6
+        #   C: Base 64       → output position 1 (empty)
+        #   D: Full Youtube  → output position 2 (empty)
+        #   E: App Link      → output position 3
+        #   F: App Name      → output position 4
+        #   G: Advertiser    → output position 5
         
         cleaned_rows = []
-        removed_count = 0
+        removed_invalid = 0
+        removed_duplicate = 0
+        seen_video_ids = set()
         
         for row in data_rows:
             # Get App Link value for filtering (source column index 2)
             app_link = row[APP_LINK_COLUMN_INDEX] if len(row) > APP_LINK_COLUMN_INDEX else ''
             
-            if self.is_valid_playstore_link(app_link):
-                # Build output row with correct column positions
-                # Source indices: 0=Advertiser, 1=Ads URL, 2=App Link, 3=App Name, 4=Video ID
-                
-                video_id = row[4] if len(row) > 4 else ''
-                app_link_val = row[2] if len(row) > 2 else ''
-                app_name = row[3] if len(row) > 3 else ''
-                advertiser = row[0] if len(row) > 0 else ''
-                
-                # Output row for columns B through H (7 columns):
-                # B=Video ID, C=empty, D=empty, E=empty, F=App Link, G=App Name, H=Advertiser
-                output_row = [
-                    video_id,      # B: Video ID
-                    '',            # C: (empty)
-                    '',            # D: Base 64 (empty)
-                    '',            # E: Full Youtube (empty)
-                    app_link_val,  # F: App Link
-                    app_name,      # G: App Name
-                    advertiser     # H: Advertiser Name
-                ]
-                
-                cleaned_rows.append(output_row)
-            else:
-                removed_count += 1
+            if not self.is_valid_playstore_link(app_link):
+                removed_invalid += 1
+                continue
+            
+            # Get Video ID for duplicate check (source column index 4)
+            video_id = row[4] if len(row) > 4 else ''
+            
+            # Skip if we've already seen this Video ID
+            if video_id and video_id in seen_video_ids:
+                removed_duplicate += 1
+                continue
+            
+            # Mark this Video ID as seen
+            if video_id:
+                seen_video_ids.add(video_id)
+            
+            # Build output row with correct column positions
+            # Source indices: 0=Advertiser, 1=Ads URL, 2=App Link, 3=App Name, 4=Video ID
+            
+            app_link_val = row[2] if len(row) > 2 else ''
+            app_name = row[3] if len(row) > 3 else ''
+            advertiser = row[0] if len(row) > 0 else ''
+            
+            # Output row for columns B through G (6 columns):
+            # B=Video ID, C=empty, D=empty, E=App Link, F=App Name, G=Advertiser
+            output_row = [
+                video_id,      # B: Video ID
+                '',            # C: Base 64 (empty)
+                '',            # D: Full Youtube (empty)
+                app_link_val,  # E: App Link
+                app_name,      # F: App Name
+                advertiser     # G: Advertiser Name
+            ]
+            
+            cleaned_rows.append(output_row)
         
         logger.info(f"✓ Cleaning complete:")
-        logger.info(f"  - Kept: {len(cleaned_rows)} rows with valid Play Store links")
-        logger.info(f"  - Removed: {removed_count} rows with invalid/missing App Links")
-        logger.info(f"  - Output: B=Video ID, F=App Link, G=App Name, H=Advertiser Name")
+        logger.info(f"  - Kept: {len(cleaned_rows)} unique valid rows")
+        logger.info(f"  - Removed invalid App Links: {removed_invalid}")
+        logger.info(f"  - Removed duplicate Video IDs: {removed_duplicate}")
+        logger.info(f"  - Output: B=Video ID, E=App Link, F=App Name, G=Advertiser")
         
         return cleaned_rows
     
