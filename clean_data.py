@@ -607,27 +607,26 @@ class DataCleaner:
             
             logger.info(f"  Converting {len(rows_to_update)} rows...")
             
-            # Prepare batch updates
-            updates = []
+            # Process in larger chunks for efficiency (500 rows at a time)
+            chunk_size = 500
+            total = len(rows_to_update)
             
-            for row_num, base64_code, youtube_url in rows_to_update:
-                # Update Column C (Base64)
-                updates.append({
-                    'range': f'C{row_num}',
-                    'values': [[base64_code]]
-                })
-                # Update Column D (YouTube URL)
-                updates.append({
-                    'range': f'D{row_num}',
-                    'values': [[youtube_url]]
-                })
-            
-            # Execute in batches (max 100 updates per batch)
-            for i in range(0, len(updates), 100):
-                batch = updates[i:i+100]
+            for start_idx in range(0, total, chunk_size):
+                end_idx = min(start_idx + chunk_size, total)
+                chunk = rows_to_update[start_idx:end_idx]
+                
+                # Build single batch update for C:D columns
+                updates = []
+                for row_num, base64_code, youtube_url in chunk:
+                    updates.append({
+                        'range': f'C{row_num}:D{row_num}',
+                        'values': [[base64_code, youtube_url]]
+                    })
+                
+                # Execute batch update
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
-                        clean_sheet.batch_update(batch, value_input_option='RAW')
+                        clean_sheet.batch_update(updates, value_input_option='RAW')
                         break
                     except Exception as e:
                         logger.warning(f"Batch update attempt {attempt} failed: {e}")
@@ -635,8 +634,8 @@ class DataCleaner:
                             raise
                         time.sleep(RETRY_DELAY * attempt)
                 
-                logger.info(f"  Updated {min(i+100, len(updates))//2}/{len(rows_to_update)} rows...")
-                time.sleep(0.5)
+                logger.info(f"  Converted {end_idx}/{total} rows...")
+                time.sleep(0.3)
             
             logger.info(f"  ✓ Converted {len(rows_to_update)} rows (Hex → Base64 → YouTube URL)")
             return len(rows_to_update)
