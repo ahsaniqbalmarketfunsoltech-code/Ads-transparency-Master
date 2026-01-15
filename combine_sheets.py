@@ -150,6 +150,26 @@ class SheetCombiner:
         
         return None
     
+    def _fix_duplicate_columns(self, df):
+        """Rename duplicate columns to make them unique"""
+        cols = df.columns.tolist()
+        seen = {}
+        new_cols = []
+        
+        for col in cols:
+            if col in seen:
+                seen[col] += 1
+                new_cols.append(f"{col}_{seen[col]}")
+            else:
+                seen[col] = 1
+                new_cols.append(col)
+        
+        if new_cols != cols:
+            logger.debug(f"    Fixed {len(cols) - len(set(cols))} duplicate column(s)")
+            df.columns = new_cols
+        
+        return df
+    
     def combine_all_sources(self, sources):
         """Fetch and combine data from all sources"""
         all_dataframes = []
@@ -161,6 +181,8 @@ class SheetCombiner:
             df = self.fetch_source_data(source)
             
             if df is not None and not df.empty:
+                # Fix any duplicate column names in this DataFrame
+                df = self._fix_duplicate_columns(df)
                 all_dataframes.append(df)
                 total_rows += len(df)
                 logger.info(f"  Running total: {total_rows} rows")
@@ -171,7 +193,25 @@ class SheetCombiner:
         
         # Combine all DataFrames
         logger.info("Combining all data...")
-        combined_df = pd.concat(all_dataframes, ignore_index=True)
+        try:
+            combined_df = pd.concat(all_dataframes, ignore_index=True)
+        except Exception as e:
+            logger.warning(f"Standard concat failed: {e}")
+            logger.info("Attempting alternative concat method...")
+            # Alternative: convert all to same columns structure
+            all_columns = set()
+            for df in all_dataframes:
+                all_columns.update(df.columns.tolist())
+            all_columns = sorted(list(all_columns))
+            
+            # Reindex all dataframes to have same columns
+            aligned_dfs = []
+            for df in all_dataframes:
+                aligned_df = df.reindex(columns=all_columns, fill_value='')
+                aligned_dfs.append(aligned_df)
+            
+            combined_df = pd.concat(aligned_dfs, ignore_index=True)
+        
         logger.info(f"✓ Combined {len(combined_df)} total rows")
         
         return combined_df
