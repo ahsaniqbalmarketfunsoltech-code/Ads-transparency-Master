@@ -427,22 +427,15 @@ class DataCleaner:
             # Mark this Video ID as seen
             seen_video_ids.add(video_id)
             
-            # Build output row (without YouTube stats - will be filled in Step 3)
-            # Output columns starting at B:
-            # B: Video ID, C: Base 64 (empty), D: Full Youtube links (leave empty as requested), 
-            # E: App Link, F: App Name, G: Advertiser Name, H: Yt Views, I: Upload Time
+            # Build output row (Video ID, App Link, App Name, Advertiser Name)
             app_name = row[3] if len(row) > 3 else ''
             advertiser = row[0] if len(row) > 0 else ''
             
             output_row = [
-                video_id,      # B: Video ID
-                '',            # C: Base 64 (empty)
-                '',            # D: Full Youtube links (Leave empty - Step 3 will use Video ID from B)
-                app_link,      # E: App Link
-                app_name,      # F: App Name
-                advertiser,    # G: Advertiser Name
-                '',            # H: Yt Views (empty - will be filled in Step 3)
-                ''             # I: Upload Time (empty - will be filled in Step 3)
+                video_id,      # For Column B
+                app_link,      # For Column E
+                app_name,      # For Column F
+                advertiser     # For Column G
             ]
             
             valid_rows.append(output_row)
@@ -456,7 +449,7 @@ class DataCleaner:
         return valid_rows
     
     def write_new_rows(self, data_rows, current_row_count):
-        """Write new rows to Clean data sheet (without YouTube stats)"""
+        """Write new rows to Clean data sheet (touching ONLY columns B and E-G)"""
         if not data_rows:
             return 0
         
@@ -473,30 +466,48 @@ class DataCleaner:
                 time.sleep(1)
             
             # Start writing after existing data
-            start_row = current_row_count + 1 if current_row_count > 1 else 2
+            start_row = current_row_count + 1
             
-            logger.info(f"  Writing {len(data_rows)} rows starting at B{start_row}...")
+            logger.info(f"  Appending {len(data_rows)} new rows (touching only B and E:G)...")
             
-            # Write in batches
+            # Prepare batch updates for efficiency
             total_rows = len(data_rows)
+            # We'll process in chunks to avoid extremely large payload sizes, 
+            # though GSheets API handles quite a bit.
             for start_idx in range(0, total_rows, BATCH_SIZE):
                 end_idx = min(start_idx + BATCH_SIZE, total_rows)
-                batch = data_rows[start_idx:end_idx]
+                chunk = data_rows[start_idx:end_idx]
+                chunk_start_row = start_row + start_idx
+                chunk_end_row = chunk_start_row + len(chunk) - 1
                 
-                sheet_row = start_row + start_idx
+                updates = []
                 
+                # Update Column B: Video ID
+                b_values = [[row[0]] for row in chunk]
+                updates.append({
+                    'range': f'B{chunk_start_row}:B{chunk_end_row}',
+                    'values': b_values
+                })
+                
+                # Update Column E:G : App Link, App Name, Advertiser Name
+                efg_values = [row[1:4] for row in chunk]
+                updates.append({
+                    'range': f'E{chunk_start_row}:G{chunk_end_row}',
+                    'values': efg_values
+                })
+                
+                # Execute batch update for this chunk
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
-                        # Write starting at column B (Video ID is first column in output)
-                        clean_sheet.update(values=batch, range_name=f'B{sheet_row}', value_input_option='RAW')
+                        clean_sheet.batch_update(updates, value_input_option='RAW')
                         break
                     except Exception as e:
-                        logger.warning(f"Write attempt {attempt} failed: {e}")
+                        logger.warning(f"Batch update attempt {attempt} failed: {e}")
                         if attempt == MAX_RETRIES:
                             raise
                         time.sleep(RETRY_DELAY * attempt)
             
-            logger.info(f"  ✓ Wrote {len(data_rows)} new rows")
+            logger.info(f"  ✓ Appended {len(data_rows)} new rows successfully")
             return len(data_rows)
             
         except Exception as e:
