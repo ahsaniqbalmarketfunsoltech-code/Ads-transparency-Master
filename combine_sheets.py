@@ -106,22 +106,39 @@ class SheetCombiner:
                 
                 return df
             
-            except gspread.exceptions.WorksheetNotFound as e:
-                logger.error(f"  Attempt {attempt} failed: Worksheet '{source['tab_name']}' not found in spreadsheet {source['sheet_id']}")
+            except PermissionError as e:
+                # Permission errors won't be fixed by retrying - skip immediately
+                logger.error(f"  ✗ PERMISSION DENIED for spreadsheet: {source['sheet_id']}")
+                logger.error(f"    → Please share this spreadsheet with your service account email")
+                logger.error(f"    → Skipping this source (retrying won't help)")
+                return None
+            
+            except gspread.exceptions.APIError as e:
+                # Check if it's a 403 permission error
+                if '403' in str(e) or 'permission' in str(e).lower():
+                    logger.error(f"  ✗ PERMISSION DENIED (403) for spreadsheet: {source['sheet_id']}")
+                    logger.error(f"    → Please share this spreadsheet with your service account email")
+                    logger.error(f"    → Skipping this source (retrying won't help)")
+                    return None
+                # For other API errors, retry
+                logger.warning(f"  Attempt {attempt} failed: APIError: {e}")
                 if attempt == MAX_RETRIES:
                     logger.error(f"  ✗ Failed after {MAX_RETRIES} attempts")
                     return None
                 time.sleep(RETRY_DELAY * attempt)
+            
+            except gspread.exceptions.WorksheetNotFound as e:
+                logger.error(f"  ✗ Worksheet '{source['tab_name']}' not found in spreadsheet {source['sheet_id']}")
+                logger.error(f"    → Skipping this source (check tab name spelling)")
+                return None
             
             except gspread.exceptions.SpreadsheetNotFound as e:
-                logger.error(f"  Attempt {attempt} failed: Spreadsheet {source['sheet_id']} not found or not accessible")
-                if attempt == MAX_RETRIES:
-                    logger.error(f"  ✗ Failed after {MAX_RETRIES} attempts")
-                    return None
-                time.sleep(RETRY_DELAY * attempt)
+                logger.error(f"  ✗ Spreadsheet {source['sheet_id']} not found")
+                logger.error(f"    → Check if spreadsheet exists or if ID is correct")
+                logger.error(f"    → Skipping this source")
+                return None
             
             except Exception as e:
-                import traceback
                 logger.warning(f"  Attempt {attempt} failed: {type(e).__name__}: {e}")
                 logger.debug(f"  Traceback: {traceback.format_exc()}")
                 
