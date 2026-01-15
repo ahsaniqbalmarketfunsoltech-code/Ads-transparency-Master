@@ -229,16 +229,38 @@ class SheetCombiner:
         try:
             master = self.client.open_by_key(self.master_sheet_id)
             
+            # Calculate required rows (data rows + 1 for header)
+            required_rows = len(df) + 1  # +1 for user's manual header row
+            required_cols = len(df.columns) if len(df.columns) > 0 else 20
+            
             # Get or create output sheet
             try:
                 output_sheet = master.worksheet('Combined Data')
-                logger.info("Clearing existing 'Combined Data' sheet...")
-                output_sheet.clear()
+                logger.info("Found existing 'Combined Data' sheet...")
+                
+                # Get current sheet size
+                current_rows = output_sheet.row_count
+                current_cols = output_sheet.col_count
+                
+                # Resize if needed BEFORE clearing/writing
+                if current_rows < required_rows or current_cols < required_cols:
+                    new_rows = max(current_rows, required_rows + 1000)  # Add buffer
+                    new_cols = max(current_cols, required_cols + 5)
+                    logger.info(f"Resizing sheet from {current_rows}x{current_cols} to {new_rows}x{new_cols}...")
+                    output_sheet.resize(rows=new_rows, cols=new_cols)
+                    time.sleep(1)
+                
+                # Clear only data rows (row 2 onwards), preserve header in row 1
+                logger.info("Clearing data rows (preserving row 1 for your header)...")
+                # Clear from A2 to the end
+                output_sheet.batch_clear([f'A2:Z{output_sheet.row_count}'])
+                
             except gspread.WorksheetNotFound:
                 logger.info("Creating 'Combined Data' sheet...")
-                output_sheet = master.add_worksheet('Combined Data', rows=1000, cols=20)
+                # Create with enough rows from the start
+                output_sheet = master.add_worksheet('Combined Data', rows=required_rows + 1000, cols=required_cols + 5)
             
-            time.sleep(1)  # Wait after clear
+            time.sleep(1)  # Wait after operations
             
             # Clean DataFrame - replace NaN, inf, -inf with empty strings
             logger.info("Cleaning data for JSON compatibility...")
@@ -251,25 +273,27 @@ class SheetCombiner:
             df = df.replace('nan', '')
             df = df.replace('None', '')
             
-            # Prepare data (NO headers - user will add manually)
+            # Prepare data (NO headers - user will add manually in row 1)
             data_to_write = df.values.tolist()
             total_rows = len(data_to_write)
             
-            logger.info(f"Writing {total_rows} data rows in batches of {BATCH_SIZE} (no headers)...")
+            logger.info(f"Writing {total_rows} data rows in batches of {BATCH_SIZE} (starting at row 2)...")
             
-            # Write in batches
+            # Write in batches - START AT ROW 2 to preserve user's header in row 1
             for start_row in range(0, total_rows, BATCH_SIZE):
                 end_row = min(start_row + BATCH_SIZE, total_rows)
                 batch = data_to_write[start_row:end_row]
                 batch_num = (start_row // BATCH_SIZE) + 1
                 total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
                 
-                logger.info(f"  Batch {batch_num}/{total_batches}: rows {start_row + 1}-{end_row}")
+                # Sheet row = data row + 2 (row 1 is header, data starts at row 2)
+                sheet_start_row = start_row + 2
+                logger.info(f"  Batch {batch_num}/{total_batches}: data rows {start_row + 1}-{end_row} → sheet rows {sheet_start_row}-{sheet_start_row + len(batch) - 1}")
                 
                 # Write with retry (using named arguments for gspread 6.x)
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
-                        cell_range = f'A{start_row + 1}'
+                        cell_range = f'A{sheet_start_row}'
                         output_sheet.update(values=batch, range_name=cell_range, value_input_option='RAW')
                         break
                     except Exception as e:
