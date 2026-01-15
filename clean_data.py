@@ -666,23 +666,24 @@ class DataCleaner:
                 last_data_row = 1 # Header is row 1
                 
                 for idx, row in enumerate(all_data[1:], start=2):  # Start at row 2 (skip header)
-                    video_id = row[1] if len(row) > 1 else ''  # Column B
+                    video_id_hex = row[1] if len(row) > 1 else ''  # Column B (hex)
                     youtube_url = row[3] if len(row) > 3 else ''  # Column D
                     app_link = row[4] if len(row) > 4 else '' # Column E
                     yt_views = row[7] if len(row) > 7 else ''  # Column H
                     
-                    # Determine Video ID to use for stats (prefer B, fallback to D)
-                    vid = video_id or self.extract_video_id(youtube_url)
+                    # Use hex ID for duplicate detection
+                    if video_id_hex:
+                        existing_video_ids.add(video_id_hex)
                     
-                    if vid:
-                        existing_video_ids.add(vid)
-                        
-                        # Check if this row is missing views
-                        if not yt_views or yt_views.strip() == '':
-                            rows_missing_views.append((idx, vid))
+                    # Extract REAL YouTube ID from Column D for stats fetching
+                    yt_video_id = self.extract_video_id(youtube_url)
+                    
+                    # Check if this row is missing views AND has a valid YouTube URL
+                    if yt_video_id and (not yt_views or yt_views.strip() == ''):
+                        rows_missing_views.append((idx, yt_video_id))
                     
                     # Update last non-empty row tracking (check B and E)
-                    if (video_id and video_id.strip()) or (app_link and app_link.strip()):
+                    if (video_id_hex and video_id_hex.strip()) or (app_link and app_link.strip()):
                         last_data_row = idx
                 
                 logger.info(f"✓ Found {len(existing_video_ids)} existing Video IDs in Clean data")
@@ -747,12 +748,13 @@ class DataCleaner:
                     })
             
             if updates:
-                # Batch update in chunks of 100
-                for i in range(0, len(updates), 100):
-                    batch = updates[i:i+100]
+                # Batch update in chunks of 500 for speed
+                chunk_size = 500
+                for i in range(0, len(updates), chunk_size):
+                    batch = updates[i:i+chunk_size]
                     clean_sheet.batch_update(batch, value_input_option='RAW')
-                    logger.info(f"  Updated {min(i+100, len(updates))}/{len(updates)} rows...")
-                    time.sleep(0.5)
+                    logger.info(f"  Updated {min(i+chunk_size, len(updates))}/{len(updates)} rows...")
+                    time.sleep(0.3)
                 
                 logger.info(f"✓ Updated {len(updates)} rows with YouTube stats")
                 return len(updates)
