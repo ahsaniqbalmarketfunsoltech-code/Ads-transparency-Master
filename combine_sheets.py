@@ -8,6 +8,7 @@ import os
 import json
 import time
 import logging
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import pandas as pd
 # Setup logging
 Path("logs").mkdir(exist_ok=True)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(f'logs/run_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
@@ -105,8 +106,24 @@ class SheetCombiner:
                 
                 return df
             
+            except gspread.exceptions.WorksheetNotFound as e:
+                logger.error(f"  Attempt {attempt} failed: Worksheet '{source['tab_name']}' not found in spreadsheet {source['sheet_id']}")
+                if attempt == MAX_RETRIES:
+                    logger.error(f"  ✗ Failed after {MAX_RETRIES} attempts")
+                    return None
+                time.sleep(RETRY_DELAY * attempt)
+            
+            except gspread.exceptions.SpreadsheetNotFound as e:
+                logger.error(f"  Attempt {attempt} failed: Spreadsheet {source['sheet_id']} not found or not accessible")
+                if attempt == MAX_RETRIES:
+                    logger.error(f"  ✗ Failed after {MAX_RETRIES} attempts")
+                    return None
+                time.sleep(RETRY_DELAY * attempt)
+            
             except Exception as e:
-                logger.warning(f"  Attempt {attempt} failed: {e}")
+                import traceback
+                logger.warning(f"  Attempt {attempt} failed: {type(e).__name__}: {e}")
+                logger.debug(f"  Traceback: {traceback.format_exc()}")
                 
                 if attempt == MAX_RETRIES:
                     logger.error(f"  ✗ Failed after {MAX_RETRIES} attempts")
@@ -180,7 +197,7 @@ class SheetCombiner:
                         output_sheet.update(cell_range, batch, value_input_option='RAW')
                         break
                     except Exception as e:
-                        logger.warning(f"    Write attempt {attempt} failed: {e}")
+                        logger.warning(f"    Write attempt {attempt} failed: {type(e).__name__}: {e}")
                         if attempt == MAX_RETRIES:
                             raise
                         time.sleep(RETRY_DELAY * attempt)
