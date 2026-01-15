@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Google Sheets Data Cleaner
-Reads from 'Combined Data' tab, filters valid Play Store links, writes to 'Clean data' tab
+Google Sheets Data Cleaner with YouTube API Integration
+Reads from 'Combined Data' tab, filters valid Play Store links, 
+fetches YouTube stats, writes to 'Clean data' tab
 Runs on GitHub Actions every hour (after combine-sheets workflow)
 """
 
@@ -10,13 +11,15 @@ import json
 import time
 import logging
 import traceback
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
 import numpy as np
+import requests
 
 # Setup logging
 Path("logs").mkdir(exist_ok=True)
@@ -35,17 +38,17 @@ BATCH_SIZE = 50000  # Rows to write per batch
 MAX_RETRIES = 5
 RETRY_DELAY = 3  # seconds
 
+# YouTube API Configuration
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY', 'AIzaSyCov_GZu8554LbvjERy2VCbRWnhUjIToZA')
+YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3/videos'
+
 # Column mapping from Combined Data (0-based indices)
 # Source columns in Combined Data:
 #   0: Advertiser Name
-#   1: Ads URL (SKIP)
+#   1: Ads URL (Full YouTube link)
 #   2: App Link ← Filter by this (must be valid Play Store link)
 #   3: App Name
 #   4: Video ID
-
-# Columns to KEEP (indices in source data) - in the order for Clean data output:
-# Output: Video ID, App Link, App Name, Advertiser Name
-COLUMNS_TO_KEEP = [4, 2, 3, 0]  # Video ID, App Link, App Name, Advertiser Name
 
 # App Link column index in SOURCE data (for filtering)
 APP_LINK_COLUMN_INDEX = 2
@@ -54,6 +57,7 @@ class DataCleaner:
     def __init__(self, credentials_json, master_sheet_id):
         """Initialize with service account credentials"""
         self.master_sheet_id = master_sheet_id
+        self.youtube_cache = {}  # Cache for YouTube stats
         
         # Authenticate
         creds_dict = json.loads(credentials_json)
@@ -65,6 +69,101 @@ class DataCleaner:
         self.client = gspread.authorize(creds)
         
         logger.info("✓ Authenticated with Google Sheets API")
+    
+    def extract_video_id(self, url):
+        """Extract YouTube video ID from URL"""
+        if not url:
+            return None
+        
+        # Handle various YouTube URL formats
+        patterns = [
+            r'youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
+            r'youtu\.be/([a-zA-Z0-9_-]{11})',
+            r'youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+            r'youtube\.com/v/([a-zA-Z0-9_-]{11})',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    def get_youtube_stats(self, video_id):
+        """Fetch YouTube video stats using API"""
+        if not video_id:
+            return None, None
+        
+        # Check cache first
+        if video_id in self.youtube_cache:
+            return self.youtube_cache[video_id]
+        
+        try:
+            params = {
+                'part': 'statistics,snippet',
+                'id': video_id,
+                'key': YOUTUBE_API_KEY
+            }
+            
+            response = requests.get(YOUTUBE_API_URL, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('items') and len(data['items']) > 0:
+                    item = data['items'][0]
+                    
+                    # Get view count
+                    view_count = item.get('statistics', {}).get('viewCount', '0')
+                    
+                    # Get upload date and calculate "time ago"
+                    published_at = item.get('snippet', {}).get('publishedAt', '')
+                    time_ago = self.calculate_time_ago(published_at)
+                    
+                    # Cache the result
+                    self.youtube_cache[video_id] = (view_count, time_ago)
+                    return view_count, time_ago
+            
+            # API error or video not found
+            self.youtube_cache[video_id] = ('', '')
+            return '', ''
+            
+        except Exception as e:
+            logger.debug(f"YouTube API error for {video_id}: {e}")
+            self.youtube_cache[video_id] = ('', '')
+            return '', ''
+    
+    def calculate_time_ago(self, published_at):
+        """Calculate how long ago a video was uploaded"""
+        if not published_at:
+            return ''
+        
+        try:
+            # Parse ISO 8601 date
+            upload_date = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
+            now = datetime.now(timezone.utc)
+            
+            diff = now - upload_date
+            
+            days = diff.days
+            if days < 1:
+                hours = diff.seconds // 3600
+                return f"{hours} hours ago" if hours != 1 else "1 hour ago"
+            elif days < 7:
+                return f"{days} days ago" if days != 1 else "1 day ago"
+            elif days < 30:
+                weeks = days // 7
+                return f"{weeks} weeks ago" if weeks != 1 else "1 week ago"
+            elif days < 365:
+                months = days // 30
+                return f"{months} months ago" if months != 1 else "1 month ago"
+            else:
+                years = days // 365
+                return f"{years} years ago" if years != 1 else "1 year ago"
+                
+        except Exception as e:
+            logger.debug(f"Error parsing date {published_at}: {e}")
+            return ''
     
     def is_valid_playstore_link(self, value):
         """Check if value is a valid Play Store link"""
@@ -117,27 +216,33 @@ class DataCleaner:
             raise
     
     def clean_data(self, data_rows):
-        """Filter rows to keep only those with valid Play Store links, remove duplicate Video IDs, and map to output columns"""
+        """Filter rows to keep only those with valid Play Store links, remove duplicate Video IDs, fetch YouTube stats"""
         if not data_rows:
             return []
         
         logger.info(f"Cleaning {len(data_rows)} rows...")
         
-        # Output column mapping (starting from column B):
+        # Output column mapping (starting from column D):
         # Clean data headers:
-        #   B: Video ID      → output position 0
-        #   C: Base 64       → output position 1 (empty)
-        #   D: Full Youtube  → output position 2 (empty)
-        #   E: App Link      → output position 3
-        #   F: App Name      → output position 4
-        #   G: Advertiser    → output position 5
+        #   D: Full Youtube links  → output position 0
+        #   E: App Link            → output position 1
+        #   F: App Name            → output position 2
+        #   G: Advertiser Name     → output position 3
+        #   H: Yt Views            → output position 4
+        #   I: Upload Time         → output position 5
         
         cleaned_rows = []
         removed_invalid = 0
         removed_duplicate = 0
         seen_video_ids = set()
+        youtube_api_calls = 0
         
-        for row in data_rows:
+        total = len(data_rows)
+        for idx, row in enumerate(data_rows):
+            # Progress logging every 10000 rows
+            if idx > 0 and idx % 10000 == 0:
+                logger.info(f"  Processing row {idx}/{total}...")
+            
             # Get App Link value for filtering (source column index 2)
             app_link = row[APP_LINK_COLUMN_INDEX] if len(row) > APP_LINK_COLUMN_INDEX else ''
             
@@ -157,22 +262,32 @@ class DataCleaner:
             if video_id:
                 seen_video_ids.add(video_id)
             
-            # Build output row with correct column positions
-            # Source indices: 0=Advertiser, 1=Ads URL, 2=App Link, 3=App Name, 4=Video ID
-            
+            # Get source data
+            # Source indices: 0=Advertiser, 1=Ads URL (YouTube link), 2=App Link, 3=App Name, 4=Video ID
+            youtube_url = row[1] if len(row) > 1 else ''
             app_link_val = row[2] if len(row) > 2 else ''
             app_name = row[3] if len(row) > 3 else ''
             advertiser = row[0] if len(row) > 0 else ''
             
-            # Output row for columns B through G (6 columns):
-            # B=Video ID, C=empty, D=empty, E=App Link, F=App Name, G=Advertiser
+            # Fetch YouTube stats (view count and upload time)
+            # Try to get video ID from URL or use the existing one
+            yt_video_id = self.extract_video_id(youtube_url) or video_id
+            view_count, time_ago = self.get_youtube_stats(yt_video_id)
+            youtube_api_calls += 1
+            
+            # Rate limit: small delay every 100 API calls
+            if youtube_api_calls % 100 == 0:
+                time.sleep(0.5)
+            
+            # Output row for columns D through I (6 columns):
+            # D=Full Youtube, E=App Link, F=App Name, G=Advertiser, H=Views, I=Upload Time
             output_row = [
-                video_id,      # B: Video ID
-                '',            # C: Base 64 (empty)
-                '',            # D: Full Youtube (empty)
+                youtube_url,   # D: Full Youtube links
                 app_link_val,  # E: App Link
                 app_name,      # F: App Name
-                advertiser     # G: Advertiser Name
+                advertiser,    # G: Advertiser Name
+                view_count,    # H: Yt Views
+                time_ago       # I: Upload Time
             ]
             
             cleaned_rows.append(output_row)
@@ -181,53 +296,54 @@ class DataCleaner:
         logger.info(f"  - Kept: {len(cleaned_rows)} unique valid rows")
         logger.info(f"  - Removed invalid App Links: {removed_invalid}")
         logger.info(f"  - Removed duplicate Video IDs: {removed_duplicate}")
-        logger.info(f"  - Output: B=Video ID, E=App Link, F=App Name, G=Advertiser")
+        logger.info(f"  - YouTube API calls: {youtube_api_calls}")
+        logger.info(f"  - Output: D=Youtube, E=App Link, F=App Name, G=Advertiser, H=Views, I=Time")
         
         return cleaned_rows
     
     def get_existing_video_ids(self):
-        """Read existing Video IDs from Clean data sheet"""
+        """Read existing YouTube URLs from Clean data sheet to avoid duplicates"""
         try:
             master = self.client.open_by_key(self.master_sheet_id)
             
             try:
                 clean_sheet = master.worksheet('Clean data')
-                # Get all values from column B (Video ID column)
+                # Get all values
                 all_data = clean_sheet.get_all_values()
                 
-                # Skip header row, get Video IDs from column B (index 1, since we read from A)
-                # But our data starts at column B, so when reading all values, B is index 1
-                existing_ids = set()
+                # Skip header row, get YouTube URLs from column D (index 3, since we read from A)
+                # Column D contains Full Youtube links
+                existing_urls = set()
                 for row in all_data[1:]:  # Skip header
-                    if len(row) > 1 and row[1]:  # Column B is index 1
-                        existing_ids.add(row[1])
+                    if len(row) > 3 and row[3]:  # Column D is index 3
+                        existing_urls.add(row[3])
                 
-                logger.info(f"✓ Found {len(existing_ids)} existing Video IDs in Clean data")
-                return existing_ids, len(all_data)  # Return IDs and current row count
+                logger.info(f"✓ Found {len(existing_urls)} existing YouTube URLs in Clean data")
+                return existing_urls, len(all_data)  # Return URLs and current row count
                 
             except gspread.WorksheetNotFound:
                 logger.info("Clean data sheet not found, will create new one")
-                return set(), 1  # No existing IDs, start after header row
+                return set(), 1  # No existing URLs, start after header row
                 
         except Exception as e:
             logger.error(f"Failed to read existing data: {e}")
             logger.debug(traceback.format_exc())
             return set(), 1
     
-    def write_to_clean_data(self, data_rows, existing_ids, current_row_count):
+    def write_to_clean_data(self, data_rows, existing_urls, current_row_count):
         """Append new cleaned data to 'Clean data' tab (incremental, no clearing)"""
         try:
             master = self.client.open_by_key(self.master_sheet_id)
             
-            # Filter out rows that already exist in Clean data
+            # Filter out rows that already exist in Clean data (by YouTube URL)
             new_rows = []
             for row in data_rows:
-                video_id = row[0]  # Video ID is first column in output
-                if video_id and video_id not in existing_ids:
+                youtube_url = row[0]  # YouTube URL is first column in output
+                if youtube_url and youtube_url not in existing_urls:
                     new_rows.append(row)
             
             if not new_rows:
-                logger.info("✓ No new data to add - all Video IDs already exist in Clean data")
+                logger.info("✓ No new data to add - all YouTube URLs already exist in Clean data")
                 return 0
             
             logger.info(f"Found {len(new_rows)} NEW rows to append (skipped {len(data_rows) - len(new_rows)} existing)")
@@ -265,7 +381,7 @@ class DataCleaner:
             # Start writing AFTER existing data
             start_sheet_row = current_row_count + 1 if current_row_count > 1 else 2
             
-            logger.info(f"Appending {total_rows} new rows starting at row {start_sheet_row}...")
+            logger.info(f"Appending {total_rows} new rows starting at D{start_sheet_row}...")
             
             # Write in batches
             for start_row in range(0, total_rows, BATCH_SIZE):
@@ -275,12 +391,12 @@ class DataCleaner:
                 total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
                 
                 sheet_start_row = start_sheet_row + start_row
-                logger.info(f"  Batch {batch_num}/{total_batches}: appending {len(batch)} rows at B{sheet_start_row}")
+                logger.info(f"  Batch {batch_num}/{total_batches}: appending {len(batch)} rows at D{sheet_start_row}")
                 
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
-                        # Start at column B
-                        cell_range = f'B{sheet_start_row}'
+                        # Start at column D (not B)
+                        cell_range = f'D{sheet_start_row}'
                         clean_sheet.update(values=batch, range_name=cell_range, value_input_option='RAW')
                         break
                     except Exception as e:
@@ -295,7 +411,7 @@ class DataCleaner:
             
             # Add timestamp note
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
-            clean_sheet.update_note('A1', f'Last updated: {timestamp}')
+            clean_sheet.update_note('D1', f'Last updated: {timestamp}')
             
             logger.info(f"✓ Appended {len(new_rows)} new rows!")
             return len(new_rows)
@@ -309,13 +425,13 @@ class DataCleaner:
         """Main execution function"""
         start_time = time.time()
         logger.info("=" * 60)
-        logger.info("Starting Google Sheets Data Cleaner (Incremental Mode)")
+        logger.info("Starting Google Sheets Data Cleaner with YouTube API")
         logger.info("=" * 60)
         
         try:
-            # Step 1: Get existing Video IDs from Clean data sheet
+            # Step 1: Get existing YouTube URLs from Clean data sheet
             logger.info("Step 1: Reading existing data from Clean data sheet...")
-            existing_ids, current_row_count = self.get_existing_video_ids()
+            existing_urls, current_row_count = self.get_existing_video_ids()
             
             # Step 2: Read from Combined Data
             logger.info("Step 2: Reading from Combined Data sheet...")
@@ -325,8 +441,9 @@ class DataCleaner:
                 logger.warning("No data to clean. Exiting.")
                 return
             
-            # Step 3: Clean the data (filter valid Play Store links, remove duplicates)
-            logger.info("Step 3: Cleaning and filtering data...")
+            # Step 3: Clean the data, fetch YouTube stats
+            logger.info("Step 3: Cleaning data and fetching YouTube stats...")
+            logger.info(f"  (This may take a while - fetching stats for each video)")
             cleaned_rows = self.clean_data(data_rows)
             
             if not cleaned_rows:
@@ -335,7 +452,7 @@ class DataCleaner:
             
             # Step 4: Append only NEW data to Clean data tab
             logger.info("Step 4: Appending new data to Clean data sheet...")
-            new_count = self.write_to_clean_data(cleaned_rows, existing_ids, current_row_count)
+            new_count = self.write_to_clean_data(cleaned_rows, existing_urls, current_row_count)
             
             # Summary
             elapsed = time.time() - start_time
