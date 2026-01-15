@@ -284,22 +284,23 @@ class DataCleaner:
             # Get Video ID for duplicate check (source column index 4)
             video_id = row[4] if len(row) > 4 else ''
             
-            # Skip if we've already seen this Video ID
-            if video_id and video_id in seen_video_ids:
+            # Get YouTube URL and extract video ID
+            youtube_url = row[1] if len(row) > 1 else ''
+            yt_video_id = self.extract_video_id(youtube_url) or video_id
+            
+            # Skip if we've already seen this Video ID in this batch
+            if yt_video_id and yt_video_id in seen_video_ids:
                 removed_duplicate += 1
                 continue
             
-            # Get YouTube URL
-            youtube_url = row[1] if len(row) > 1 else ''
-            
-            # Skip if already in Clean data sheet
-            if youtube_url and youtube_url in existing_urls:
+            # Skip if already in Clean data sheet (compare by video ID)
+            if yt_video_id and yt_video_id in existing_urls:
                 removed_existing += 1
                 continue
             
             # Mark this Video ID as seen
-            if video_id:
-                seen_video_ids.add(video_id)
+            if yt_video_id:
+                seen_video_ids.add(yt_video_id)
             
             valid_rows.append(row)
         
@@ -380,7 +381,7 @@ class DataCleaner:
         return cleaned_rows
     
     def get_existing_video_ids(self):
-        """Read existing data from Clean data sheet - URLs and rows missing views"""
+        """Read existing data from Clean data sheet - Video IDs and rows missing views"""
         try:
             master = self.client.open_by_key(self.master_sheet_id)
             
@@ -392,7 +393,7 @@ class DataCleaner:
                 # Skip header row
                 # Column D (index 3): Full Youtube links
                 # Column H (index 7): Yt Views
-                existing_urls = set()
+                existing_video_ids = set()  # Store video IDs, not full URLs
                 rows_missing_views = []  # List of (row_number, youtube_url) that need stats
                 
                 for idx, row in enumerate(all_data[1:], start=2):  # Start at row 2 (skip header)
@@ -400,16 +401,19 @@ class DataCleaner:
                     yt_views = row[7] if len(row) > 7 else ''
                     
                     if youtube_url:
-                        existing_urls.add(youtube_url)
+                        # Extract video ID for reliable comparison
+                        video_id = self.extract_video_id(youtube_url)
+                        if video_id:
+                            existing_video_ids.add(video_id)
                         
                         # Check if this row is missing views
                         if not yt_views or yt_views.strip() == '':
                             rows_missing_views.append((idx, youtube_url))
                 
-                logger.info(f"✓ Found {len(existing_urls)} existing YouTube URLs in Clean data")
+                logger.info(f"✓ Found {len(existing_video_ids)} existing Video IDs in Clean data")
                 logger.info(f"  - Rows missing views: {len(rows_missing_views)}")
                 
-                return existing_urls, len(all_data), rows_missing_views
+                return existing_video_ids, len(all_data), rows_missing_views
                 
             except gspread.WorksheetNotFound:
                 logger.info("Clean data sheet not found, will create new one")
@@ -485,20 +489,21 @@ class DataCleaner:
         
         return 0
     
-    def write_to_clean_data(self, data_rows, existing_urls, current_row_count):
+    def write_to_clean_data(self, data_rows, existing_video_ids, current_row_count):
         """Append new cleaned data to 'Clean data' tab (incremental, no clearing)"""
         try:
             master = self.client.open_by_key(self.master_sheet_id)
             
-            # Filter out rows that already exist in Clean data (by YouTube URL)
+            # Filter out rows that already exist in Clean data (by Video ID)
             new_rows = []
             for row in data_rows:
                 youtube_url = row[0]  # YouTube URL is first column in output
-                if youtube_url and youtube_url not in existing_urls:
+                video_id = self.extract_video_id(youtube_url)
+                if video_id and video_id not in existing_video_ids:
                     new_rows.append(row)
             
             if not new_rows:
-                logger.info("✓ No new data to add - all YouTube URLs already exist in Clean data")
+                logger.info("✓ No new data to add - all Video IDs already exist in Clean data")
                 return 0
             
             logger.info(f"Found {len(new_rows)} NEW rows to append (skipped {len(data_rows) - len(new_rows)} existing)")
