@@ -37,18 +37,18 @@ RETRY_DELAY = 3  # seconds
 
 # Column mapping from Combined Data (0-based indices)
 # Source columns in Combined Data:
-#   0: Video ID
-#   1: Base 64 (SKIP)
-#   2: Full Youtube links (SKIP)
-#   3: App Link
-#   4: App Name
-#   5: Advertiser Name
+#   0: Advertiser Name
+#   1: Ads URL (SKIP)
+#   2: App Link ← Filter by this (must be valid Play Store link)
+#   3: App Name
+#   4: Video ID
 
-# Columns to KEEP (indices in source data) - in order they should appear in output
-COLUMNS_TO_KEEP = [0, 3, 4, 5]  # Video ID, App Link, App Name, Advertiser Name
+# Columns to KEEP (indices in source data) - in the order for Clean data output:
+# Output: Video ID, App Link, App Name, Advertiser Name
+COLUMNS_TO_KEEP = [4, 2, 3, 0]  # Video ID, App Link, App Name, Advertiser Name
 
 # App Link column index in SOURCE data (for filtering)
-APP_LINK_COLUMN_INDEX = 3
+APP_LINK_COLUMN_INDEX = 2
 
 class DataCleaner:
     def __init__(self, credentials_json, master_sheet_id):
