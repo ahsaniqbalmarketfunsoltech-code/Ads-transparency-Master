@@ -185,14 +185,56 @@ class DataCleaner:
         
         return cleaned_rows
     
-    def write_to_clean_data(self, data_rows):
-        """Write cleaned data to 'Clean data' tab"""
+    def get_existing_video_ids(self):
+        """Read existing Video IDs from Clean data sheet"""
         try:
             master = self.client.open_by_key(self.master_sheet_id)
             
+            try:
+                clean_sheet = master.worksheet('Clean data')
+                # Get all values from column B (Video ID column)
+                all_data = clean_sheet.get_all_values()
+                
+                # Skip header row, get Video IDs from column B (index 1, since we read from A)
+                # But our data starts at column B, so when reading all values, B is index 1
+                existing_ids = set()
+                for row in all_data[1:]:  # Skip header
+                    if len(row) > 1 and row[1]:  # Column B is index 1
+                        existing_ids.add(row[1])
+                
+                logger.info(f"✓ Found {len(existing_ids)} existing Video IDs in Clean data")
+                return existing_ids, len(all_data)  # Return IDs and current row count
+                
+            except gspread.WorksheetNotFound:
+                logger.info("Clean data sheet not found, will create new one")
+                return set(), 1  # No existing IDs, start after header row
+                
+        except Exception as e:
+            logger.error(f"Failed to read existing data: {e}")
+            logger.debug(traceback.format_exc())
+            return set(), 1
+    
+    def write_to_clean_data(self, data_rows, existing_ids, current_row_count):
+        """Append new cleaned data to 'Clean data' tab (incremental, no clearing)"""
+        try:
+            master = self.client.open_by_key(self.master_sheet_id)
+            
+            # Filter out rows that already exist in Clean data
+            new_rows = []
+            for row in data_rows:
+                video_id = row[0]  # Video ID is first column in output
+                if video_id and video_id not in existing_ids:
+                    new_rows.append(row)
+            
+            if not new_rows:
+                logger.info("✓ No new data to add - all Video IDs already exist in Clean data")
+                return 0
+            
+            logger.info(f"Found {len(new_rows)} NEW rows to append (skipped {len(data_rows) - len(new_rows)} existing)")
+            
             # Calculate required rows
-            required_rows = len(data_rows) + 1  # +1 for header row
-            required_cols = max(len(row) for row in data_rows) if data_rows else 20
+            required_rows = current_row_count + len(new_rows)
+            required_cols = max(len(row) for row in new_rows) if new_rows else 20
             
             # Get or create 'Clean data' sheet
             try:
@@ -204,42 +246,40 @@ class DataCleaner:
                 current_cols = clean_sheet.col_count
                 
                 if current_rows < required_rows or current_cols < required_cols:
-                    new_rows = max(current_rows, required_rows + 1000)
+                    new_row_count = max(current_rows, required_rows + 1000)
                     new_cols = max(current_cols, required_cols + 5)
-                    logger.info(f"Resizing sheet from {current_rows}x{current_cols} to {new_rows}x{new_cols}...")
-                    clean_sheet.resize(rows=new_rows, cols=new_cols)
+                    logger.info(f"Resizing sheet from {current_rows}x{current_cols} to {new_row_count}x{new_cols}...")
+                    clean_sheet.resize(rows=new_row_count, cols=new_cols)
                     time.sleep(1)
                 
-                # Clear only data rows (row 2 onwards), preserve header in row 1
-                logger.info("Clearing data rows (preserving row 1 header)...")
-                clean_sheet.batch_clear([f'B2:Z{clean_sheet.row_count}'])
+                # NO CLEARING - we're appending!
                 
             except gspread.WorksheetNotFound:
                 logger.info("Creating 'Clean data' sheet...")
                 clean_sheet = master.add_worksheet('Clean data', rows=required_rows + 1000, cols=required_cols + 5)
+                current_row_count = 1  # Start after header row
             
             time.sleep(1)
             
-            if not data_rows:
-                logger.warning("No data to write after cleaning")
-                return
+            total_rows = len(new_rows)
+            # Start writing AFTER existing data
+            start_sheet_row = current_row_count + 1 if current_row_count > 1 else 2
             
-            total_rows = len(data_rows)
-            logger.info(f"Writing {total_rows} clean rows in batches of {BATCH_SIZE} (starting at B2)...")
+            logger.info(f"Appending {total_rows} new rows starting at row {start_sheet_row}...")
             
-            # Write in batches - START AT COLUMN B, ROW 2 to match headers
+            # Write in batches
             for start_row in range(0, total_rows, BATCH_SIZE):
                 end_row = min(start_row + BATCH_SIZE, total_rows)
-                batch = data_rows[start_row:end_row]
+                batch = new_rows[start_row:end_row]
                 batch_num = (start_row // BATCH_SIZE) + 1
                 total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
                 
-                sheet_start_row = start_row + 2  # Row 1 is header
-                logger.info(f"  Batch {batch_num}/{total_batches}: rows {start_row + 1}-{end_row} → sheet B{sheet_start_row}")
+                sheet_start_row = start_sheet_row + start_row
+                logger.info(f"  Batch {batch_num}/{total_batches}: appending {len(batch)} rows at B{sheet_start_row}")
                 
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
-                        # Start at column B (not A) to match header layout
+                        # Start at column B
                         cell_range = f'B{sheet_start_row}'
                         clean_sheet.update(values=batch, range_name=cell_range, value_input_option='RAW')
                         break
@@ -255,9 +295,10 @@ class DataCleaner:
             
             # Add timestamp note
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
-            clean_sheet.update_note('A1', f'Last cleaned: {timestamp}')
+            clean_sheet.update_note('A1', f'Last updated: {timestamp}')
             
-            logger.info("✓ Write complete!")
+            logger.info(f"✓ Appended {len(new_rows)} new rows!")
+            return len(new_rows)
             
         except Exception as e:
             logger.error(f"Failed to write clean data: {e}")
@@ -268,35 +309,44 @@ class DataCleaner:
         """Main execution function"""
         start_time = time.time()
         logger.info("=" * 60)
-        logger.info("Starting Google Sheets Data Cleaner")
+        logger.info("Starting Google Sheets Data Cleaner (Incremental Mode)")
         logger.info("=" * 60)
         
         try:
-            # Read from Combined Data
+            # Step 1: Get existing Video IDs from Clean data sheet
+            logger.info("Step 1: Reading existing data from Clean data sheet...")
+            existing_ids, current_row_count = self.get_existing_video_ids()
+            
+            # Step 2: Read from Combined Data
+            logger.info("Step 2: Reading from Combined Data sheet...")
             data_rows = self.read_combined_data()
             
             if not data_rows:
                 logger.warning("No data to clean. Exiting.")
                 return
             
-            # Clean the data
+            # Step 3: Clean the data (filter valid Play Store links, remove duplicates)
+            logger.info("Step 3: Cleaning and filtering data...")
             cleaned_rows = self.clean_data(data_rows)
             
             if not cleaned_rows:
                 logger.warning("No valid rows after cleaning. Exiting.")
                 return
             
-            # Write to Clean data tab
-            self.write_to_clean_data(cleaned_rows)
+            # Step 4: Append only NEW data to Clean data tab
+            logger.info("Step 4: Appending new data to Clean data sheet...")
+            new_count = self.write_to_clean_data(cleaned_rows, existing_ids, current_row_count)
             
             # Summary
             elapsed = time.time() - start_time
             logger.info("=" * 60)
             logger.info(f"✓ SUCCESS!")
-            logger.info(f"  Original rows: {len(data_rows)}")
-            logger.info(f"  Clean rows: {len(cleaned_rows)}")
-            logger.info(f"  Removed: {len(data_rows) - len(cleaned_rows)} invalid rows")
+            logger.info(f"  Combined Data rows: {len(data_rows)}")
+            logger.info(f"  After cleaning: {len(cleaned_rows)} valid rows")
+            logger.info(f"  Already in Clean data: {len(existing_ids)}")
+            logger.info(f"  NEW rows added: {new_count}")
             logger.info(f"  Time elapsed: {elapsed:.1f} seconds")
+            logger.info("=" * 60)
             logger.info("=" * 60)
         
         except Exception as e:
