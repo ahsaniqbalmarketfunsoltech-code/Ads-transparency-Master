@@ -117,37 +117,59 @@ class DataCleaner:
             raise
     
     def clean_data(self, data_rows):
-        """Filter rows to keep only those with valid Play Store links, and select specific columns"""
+        """Filter rows to keep only those with valid Play Store links, and map to output columns"""
         if not data_rows:
             return []
         
         logger.info(f"Cleaning {len(data_rows)} rows...")
-        logger.info(f"  Keeping columns at indices: {COLUMNS_TO_KEEP}")
+        
+        # Output column mapping (0-based, starting from column B):
+        # Clean data headers:
+        #   A: Youtube Temp (skip - we start at B)
+        #   B: Video ID      → output position 0
+        #   C: (empty)       → output position 1 (empty)
+        #   D: Base 64       → output position 2 (empty)
+        #   E: Full Youtube  → output position 3 (empty)
+        #   F: App Link      → output position 4
+        #   G: App Name      → output position 5
+        #   H: Advertiser    → output position 6
         
         cleaned_rows = []
         removed_count = 0
         
         for row in data_rows:
-            # Get App Link value for filtering
+            # Get App Link value for filtering (source column index 2)
             app_link = row[APP_LINK_COLUMN_INDEX] if len(row) > APP_LINK_COLUMN_INDEX else ''
             
             if self.is_valid_playstore_link(app_link):
-                # Extract only the columns we want to keep
-                filtered_row = []
-                for col_idx in COLUMNS_TO_KEEP:
-                    if col_idx < len(row):
-                        filtered_row.append(row[col_idx])
-                    else:
-                        filtered_row.append('')  # Empty if column doesn't exist
+                # Build output row with correct column positions
+                # Source indices: 0=Advertiser, 1=Ads URL, 2=App Link, 3=App Name, 4=Video ID
                 
-                cleaned_rows.append(filtered_row)
+                video_id = row[4] if len(row) > 4 else ''
+                app_link_val = row[2] if len(row) > 2 else ''
+                app_name = row[3] if len(row) > 3 else ''
+                advertiser = row[0] if len(row) > 0 else ''
+                
+                # Output row for columns B through H (7 columns):
+                # B=Video ID, C=empty, D=empty, E=empty, F=App Link, G=App Name, H=Advertiser
+                output_row = [
+                    video_id,      # B: Video ID
+                    '',            # C: (empty)
+                    '',            # D: Base 64 (empty)
+                    '',            # E: Full Youtube (empty)
+                    app_link_val,  # F: App Link
+                    app_name,      # G: App Name
+                    advertiser     # H: Advertiser Name
+                ]
+                
+                cleaned_rows.append(output_row)
             else:
                 removed_count += 1
         
         logger.info(f"✓ Cleaning complete:")
         logger.info(f"  - Kept: {len(cleaned_rows)} rows with valid Play Store links")
         logger.info(f"  - Removed: {removed_count} rows with invalid/missing App Links")
-        logger.info(f"  - Output columns: Video ID, App Link, App Name, Advertiser Name")
+        logger.info(f"  - Output: B=Video ID, F=App Link, G=App Name, H=Advertiser Name")
         
         return cleaned_rows
     
@@ -178,7 +200,7 @@ class DataCleaner:
                 
                 # Clear only data rows (row 2 onwards), preserve header in row 1
                 logger.info("Clearing data rows (preserving row 1 header)...")
-                clean_sheet.batch_clear([f'A2:Z{clean_sheet.row_count}'])
+                clean_sheet.batch_clear([f'B2:Z{clean_sheet.row_count}'])
                 
             except gspread.WorksheetNotFound:
                 logger.info("Creating 'Clean data' sheet...")
@@ -191,9 +213,9 @@ class DataCleaner:
                 return
             
             total_rows = len(data_rows)
-            logger.info(f"Writing {total_rows} clean rows in batches of {BATCH_SIZE} (starting at row 2)...")
+            logger.info(f"Writing {total_rows} clean rows in batches of {BATCH_SIZE} (starting at B2)...")
             
-            # Write in batches - START AT ROW 2 to preserve header
+            # Write in batches - START AT COLUMN B, ROW 2 to match headers
             for start_row in range(0, total_rows, BATCH_SIZE):
                 end_row = min(start_row + BATCH_SIZE, total_rows)
                 batch = data_rows[start_row:end_row]
@@ -201,11 +223,12 @@ class DataCleaner:
                 total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
                 
                 sheet_start_row = start_row + 2  # Row 1 is header
-                logger.info(f"  Batch {batch_num}/{total_batches}: rows {start_row + 1}-{end_row} → sheet rows {sheet_start_row}-{sheet_start_row + len(batch) - 1}")
+                logger.info(f"  Batch {batch_num}/{total_batches}: rows {start_row + 1}-{end_row} → sheet B{sheet_start_row}")
                 
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
-                        cell_range = f'A{sheet_start_row}'
+                        # Start at column B (not A) to match header layout
+                        cell_range = f'B{sheet_start_row}'
                         clean_sheet.update(values=batch, range_name=cell_range, value_input_option='RAW')
                         break
                     except Exception as e:
