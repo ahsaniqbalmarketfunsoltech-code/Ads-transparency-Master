@@ -94,15 +94,23 @@ class SheetCombiner:
                 spreadsheet = self.client.open_by_key(source['sheet_id'])
                 worksheet = spreadsheet.worksheet(source['tab_name'])
                 
-                # Get all values as DataFrame
+                # Get all values (skip header row)
                 data = worksheet.get_all_values()
                 
                 if not data:
                     logger.warning(f"  No data found in '{source['tab_name']}'")
                     return None
                 
-                df = pd.DataFrame(data[1:], columns=data[0])
-                logger.info(f"  ✓ Fetched {len(df)} rows from '{source['tab_name']}'")
+                # Skip header row (index 0), just take data rows
+                data_rows = data[1:] if len(data) > 1 else []
+                
+                if not data_rows:
+                    logger.warning(f"  No data rows found in '{source['tab_name']}' (only header)")
+                    return None
+                
+                # Create DataFrame without using headers as column names
+                df = pd.DataFrame(data_rows)
+                logger.info(f"  ✓ Fetched {len(df)} data rows from '{source['tab_name']}' (header skipped)")
                 
                 return df
             
@@ -232,11 +240,22 @@ class SheetCombiner:
             
             time.sleep(1)  # Wait after clear
             
-            # Prepare data (add headers)
-            data_to_write = [df.columns.tolist()] + df.values.tolist()
+            # Clean DataFrame - replace NaN, inf, -inf with empty strings
+            logger.info("Cleaning data for JSON compatibility...")
+            import numpy as np
+            df = df.fillna('')  # Replace NaN with empty string
+            df = df.replace([np.inf, -np.inf], '')  # Replace inf values
+            
+            # Convert all values to strings to avoid JSON issues
+            df = df.astype(str)
+            df = df.replace('nan', '')
+            df = df.replace('None', '')
+            
+            # Prepare data (NO headers - user will add manually)
+            data_to_write = df.values.tolist()
             total_rows = len(data_to_write)
             
-            logger.info(f"Writing {total_rows} rows in batches of {BATCH_SIZE}...")
+            logger.info(f"Writing {total_rows} data rows in batches of {BATCH_SIZE} (no headers)...")
             
             # Write in batches
             for start_row in range(0, total_rows, BATCH_SIZE):
@@ -247,11 +266,11 @@ class SheetCombiner:
                 
                 logger.info(f"  Batch {batch_num}/{total_batches}: rows {start_row + 1}-{end_row}")
                 
-                # Write with retry
+                # Write with retry (using named arguments for gspread 6.x)
                 for attempt in range(1, MAX_RETRIES + 1):
                     try:
                         cell_range = f'A{start_row + 1}'
-                        output_sheet.update(cell_range, batch, value_input_option='RAW')
+                        output_sheet.update(values=batch, range_name=cell_range, value_input_option='RAW')
                         break
                     except Exception as e:
                         logger.warning(f"    Write attempt {attempt} failed: {type(e).__name__}: {e}")
