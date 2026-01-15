@@ -93,6 +93,52 @@ class DataCleaner:
         
         return None
     
+    def hex_to_base64(self, hex_string):
+        """
+        Convert a hex string (Video ID from Column B) to YouTube Base64 code.
+        This replicates the Google Sheets formula logic.
+        """
+        if not hex_string or not isinstance(hex_string, str):
+            return ''
+        
+        # Clean the hex string
+        hex_string = hex_string.strip().lower()
+        
+        # Validate hex string (must be even length and valid hex chars)
+        if len(hex_string) % 2 != 0:
+            return ''
+        if not all(c in '0123456789abcdef' for c in hex_string):
+            return ''
+        
+        try:
+            # YouTube's URL-safe Base64 alphabet
+            alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            
+            # Convert hex to bytes
+            num_bytes = len(hex_string) // 2
+            binary_str = ''
+            for i in range(num_bytes):
+                byte_hex = hex_string[i*2:(i*2)+2]
+                byte_val = int(byte_hex, 16)
+                binary_str += format(byte_val, '08b')  # 8-bit binary
+            
+            # Pad binary string to make length divisible by 6
+            bits = len(binary_str)
+            groups = (bits + 5) // 6  # Ceiling division
+            padded = binary_str + '0' * (groups * 6 - bits)
+            
+            # Convert 6-bit groups to base64 characters
+            base64_result = ''
+            for g in range(groups):
+                six_bits = padded[g*6:(g*6)+6]
+                index = int(six_bits, 2)
+                base64_result += alphabet[index]
+            
+            return base64_result
+        except Exception as e:
+            logger.debug(f"Failed to convert hex '{hex_string}' to base64: {e}")
+            return ''
+    
     def get_youtube_stats_batch(self, video_ids):
         """Fetch YouTube stats for multiple videos in one API call (up to 50)"""
         if not video_ids:
@@ -515,6 +561,91 @@ class DataCleaner:
             logger.debug(traceback.format_exc())
             raise
     
+    def convert_hex_to_youtube_urls(self):
+        """
+        Step 3: Convert Hex Video IDs (Column B) to Base64 (Column C) and YouTube URLs (Column D).
+        Only processes rows where Column C or Column D are empty but Column B has a value.
+        """
+        logger.info("Step 3: Converting Hex IDs to Base64 and YouTube URLs...")
+        
+        try:
+            master = self.client.open_by_key(self.master_sheet_id)
+            clean_sheet = master.worksheet('Clean data')
+            
+            # Get all values
+            all_data = clean_sheet.get_all_values()
+            
+            if len(all_data) <= 1:
+                logger.info("  No data rows to process.")
+                return 0
+            
+            # Find rows that need conversion (have B but missing C or D)
+            rows_to_update = []
+            
+            for idx, row in enumerate(all_data[1:], start=2):  # Skip header
+                video_id_hex = row[1] if len(row) > 1 else ''  # Column B
+                base64_code = row[2] if len(row) > 2 else ''   # Column C
+                youtube_url = row[3] if len(row) > 3 else ''   # Column D
+                
+                # Check if we need to convert
+                if video_id_hex and video_id_hex.strip():
+                    needs_base64 = not base64_code or not base64_code.strip()
+                    needs_url = not youtube_url or not youtube_url.strip()
+                    
+                    if needs_base64 or needs_url:
+                        # Convert hex to base64
+                        converted_base64 = self.hex_to_base64(video_id_hex)
+                        
+                        if converted_base64:
+                            # Build YouTube URL
+                            full_url = f"https://www.youtube.com/watch?v={converted_base64}"
+                            rows_to_update.append((idx, converted_base64, full_url))
+            
+            if not rows_to_update:
+                logger.info("  No rows need Hex→Base64 conversion.")
+                return 0
+            
+            logger.info(f"  Converting {len(rows_to_update)} rows...")
+            
+            # Prepare batch updates
+            updates = []
+            
+            for row_num, base64_code, youtube_url in rows_to_update:
+                # Update Column C (Base64)
+                updates.append({
+                    'range': f'C{row_num}',
+                    'values': [[base64_code]]
+                })
+                # Update Column D (YouTube URL)
+                updates.append({
+                    'range': f'D{row_num}',
+                    'values': [[youtube_url]]
+                })
+            
+            # Execute in batches (max 100 updates per batch)
+            for i in range(0, len(updates), 100):
+                batch = updates[i:i+100]
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        clean_sheet.batch_update(batch, value_input_option='RAW')
+                        break
+                    except Exception as e:
+                        logger.warning(f"Batch update attempt {attempt} failed: {e}")
+                        if attempt == MAX_RETRIES:
+                            raise
+                        time.sleep(RETRY_DELAY * attempt)
+                
+                logger.info(f"  Updated {min(i+100, len(updates))//2}/{len(rows_to_update)} rows...")
+                time.sleep(0.5)
+            
+            logger.info(f"  ✓ Converted {len(rows_to_update)} rows (Hex → Base64 → YouTube URL)")
+            return len(rows_to_update)
+            
+        except Exception as e:
+            logger.error(f"Failed to convert hex to YouTube URLs: {e}")
+            logger.debug(traceback.format_exc())
+            return 0
+    
     def get_existing_video_ids(self):
         """Read existing data from Clean data sheet - Video IDs and rows missing views"""
         try:
@@ -762,9 +893,14 @@ class DataCleaner:
                 logger.info("Step 2: No new rows to add - all data already exists")
             
             # ============================================
-            # STEP 3: Update ALL rows missing YouTube views
+            # STEP 3: Convert Hex IDs to Base64 and YouTube URLs
             # ============================================
-            logger.info("Step 3: Checking for rows missing YouTube views...")
+            converted_count = self.convert_hex_to_youtube_urls()
+            
+            # ============================================
+            # STEP 4: Update ALL rows missing YouTube views
+            # ============================================
+            logger.info("Step 4: Checking for rows missing YouTube views...")
             
             # Re-read Clean data to get rows missing views (includes newly added rows)
             _, _, rows_missing_views = self.get_existing_video_ids()
@@ -785,6 +921,7 @@ class DataCleaner:
             logger.info(f"  Combined Data rows: {len(data_rows)}")
             logger.info(f"  Already in Clean data: {len(existing_video_ids)}")
             logger.info(f"  NEW rows added: {new_count}")
+            logger.info(f"  Hex→Base64 conversions: {converted_count}")
             logger.info(f"  Rows updated with YouTube stats: {updated_count}")
             logger.info(f"  Time elapsed: {elapsed:.1f} seconds")
             logger.info(f"  YouTube API quota used: ~{api_calls} units")
