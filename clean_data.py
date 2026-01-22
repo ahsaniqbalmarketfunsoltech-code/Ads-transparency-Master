@@ -12,6 +12,7 @@ import time
 import logging
 import traceback
 import re
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -122,7 +123,26 @@ class DataCleaner:
             )
             self.bq_client.create_table(table)
 
+    def hex_to_youtube_id(self, hex_id):
+        """Convert hexadecimal video ID to YouTube Base64 ID"""
+        if not hex_id:
+            return None
+        try:
+            # Clean the hex string
+            hex_clean = hex_id.strip().lower()
+            # Convert hex to bytes
+            video_bytes = bytes.fromhex(hex_clean)
+            # Encode to Base64
+            b64 = base64.b64encode(video_bytes).decode('utf-8')
+            # Make URL-safe: replace + with -, / with _, remove = padding
+            youtube_id = b64.replace('+', '-').replace('/', '_').rstrip('=')
+            return youtube_id
+        except Exception as e:
+            logger.debug(f"Failed to convert hex '{hex_id}': {e}")
+            return None
+
     def extract_video_id(self, url):
+        """Extract video ID from YouTube URL or return None"""
         if not url: return None
         patterns = [
             r'youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
@@ -147,27 +167,41 @@ class DataCleaner:
             return {vid: self.youtube_cache.get(vid, (None, None)) for vid in video_ids}
 
         logger.info(f"Fetching stats for {len(uncached)} videos from YouTube API...")
-        logger.info(f"Sample IDs: {uncached[:5]}")
+        logger.info(f"Sample hex IDs: {uncached[:3]}")
+        
+        # Convert hex IDs to YouTube Base64 IDs
+        # Build mapping: hex_id -> youtube_id
+        hex_to_yt = {}
+        yt_to_hex = {}
+        for hex_id in uncached:
+            yt_id = self.hex_to_youtube_id(hex_id)
+            if yt_id:
+                hex_to_yt[hex_id] = yt_id
+                yt_to_hex[yt_id] = hex_id
+        
+        youtube_ids = list(hex_to_yt.values())
+        logger.info(f"Converted to {len(youtube_ids)} YouTube IDs")
+        logger.info(f"Sample YouTube IDs: {youtube_ids[:3]}")
         
         # Mask API key for logging
         masked_key = f"{YOUTUBE_API_KEY[:4]}...{YOUTUBE_API_KEY[-4:]}" if YOUTUBE_API_KEY else "Missing"
         logger.info(f"Using YouTube API Key: {masked_key}")
 
-        for i in range(0, len(uncached), 50):
-            batch = uncached[i:i+50]
+        for i in range(0, len(youtube_ids), 50):
+            batch_yt = youtube_ids[i:i+50]
             try:
                 params = {
                     'part': 'statistics,snippet',
-                    'id': ','.join(batch),
+                    'id': ','.join(batch_yt),
                     'key': YOUTUBE_API_KEY
                 }
                 resp = requests.get(YOUTUBE_API_URL, params=params, timeout=30)
                 
                 if resp.status_code == 200:
                     data = resp.json()
-                    found_ids = set()
+                    found_yt_ids = set()
                     for item in data.get('items', []):
-                        vid = item['id']
+                        yt_id = item['id']
                         stats = item.get('statistics', {})
                         views = int(stats.get('viewCount', 0))
                         
@@ -176,25 +210,36 @@ class DataCleaner:
                         pub_at = snippet.get('publishedAt')
                         time_ago = self.calculate_time_ago(pub_at) if pub_at else ""
                         
-                        self.youtube_cache[vid] = (views, time_ago)
-                        found_ids.add(vid)
+                        # Map back to hex ID and cache
+                        if yt_id in yt_to_hex:
+                            hex_id = yt_to_hex[yt_id]
+                            self.youtube_cache[hex_id] = (views, time_ago)
+                            found_yt_ids.add(yt_id)
                     
-                    # Mark missing
-                    for vid in batch:
-                        if vid not in found_ids:
-                            self.youtube_cache[vid] = (None, None)
+                    # Mark missing (videos not found in API response)
+                    for yt_id in batch_yt:
+                        if yt_id not in found_yt_ids and yt_id in yt_to_hex:
+                            hex_id = yt_to_hex[yt_id]
+                            self.youtube_cache[hex_id] = (None, None)
                 else:
                     logger.error(f"YouTube API Error: Status {resp.status_code}")
-                    logger.error(f"Response: {resp.text}")
-                    for vid in batch:
-                        self.youtube_cache[vid] = (None, None)
+                    logger.error(f"Response: {resp.text[:500]}")
+                    for yt_id in batch_yt:
+                        if yt_id in yt_to_hex:
+                            self.youtube_cache[yt_to_hex[yt_id]] = (None, None)
                         
             except Exception as e:
                 logger.error(f"Request Failure: {e}")
-                for vid in batch:
-                    self.youtube_cache[vid] = (None, None)
+                for yt_id in batch_yt:
+                    if yt_id in yt_to_hex:
+                        self.youtube_cache[yt_to_hex[yt_id]] = (None, None)
             
             time.sleep(0.1)
+        
+        # Mark any hex IDs that couldn't be converted
+        for hex_id in uncached:
+            if hex_id not in self.youtube_cache:
+                self.youtube_cache[hex_id] = (None, None)
             
         return {vid: self.youtube_cache.get(vid, (None, None)) for vid in video_ids}
 
@@ -245,21 +290,28 @@ class DataCleaner:
         data = []
         for row in raw_rows:
             advertiser = row[0] if len(row) > 0 else ''
-            url = row[1] if len(row) > 1 else ''
+            url = row[1] if len(row) > 1 else ''  # This is the Ads Transparency URL
             app_link = row[2] if len(row) > 2 else ''
             app_name = row[3] if len(row) > 3 else ''
             
             if 'play.google.com' not in app_link:
                 continue
+            
+            # Get hex video ID from column 4 (or try to extract from URL)
+            hex_vid = row[4].strip() if len(row) > 4 and row[4] else ''
+            
+            # If no hex ID, try to extract from URL (for compatibility)
+            if not hex_vid:
+                hex_vid = self.extract_video_id(url)
                 
-            vid = self.extract_video_id(url)
-            if not vid and len(row) > 4:
-                vid = row[4]
+            if hex_vid:
+                # Convert hex ID to YouTube Base64 ID for the URL
+                yt_id = self.hex_to_youtube_id(hex_vid)
+                youtube_url = f"https://www.youtube.com/watch?v={yt_id}" if yt_id else url
                 
-            if vid:
                 data.append({
-                    'video_id': vid,
-                    'youtube_url': url,
+                    'video_id': hex_vid,  # Store hex ID as the key
+                    'youtube_url': youtube_url,  # Store actual YouTube URL
                     'app_link': app_link,
                     'app_name': app_name,
                     'advertiser_name': advertiser
