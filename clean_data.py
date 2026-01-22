@@ -327,6 +327,17 @@ class DataCleaner:
         # 3. Get Existing Data from BigQuery
         df_bq = self.get_bq_state()
         
+        # FIX: Ensure all existing BigQuery rows use proper YouTube links
+        if not df_bq.empty:
+            logger.info("Normalizing URLs for existing BigQuery records...")
+            def fix_url(row):
+                if 'adstransparency.google.com' in str(row['youtube_url']):
+                    yt_id = self.hex_to_youtube_id(row['video_id'])
+                    return f"https://www.youtube.com/watch?v={yt_id}" if yt_id else row['youtube_url']
+                return row['youtube_url']
+            
+            df_bq['youtube_url'] = df_bq.apply(fix_url, axis=1)
+        
         # 4. Identify videos that need YouTube stats:
         #    a) NEW videos (not in BQ)
         #    b) INCOMPLETE videos (in BQ but views=0/null OR upload_time is empty)
