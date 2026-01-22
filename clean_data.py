@@ -89,7 +89,12 @@ class DataCleaner:
             logger.info(f"Creating dataset '{self.dataset_id}'...")
             dataset = bigquery.Dataset(dataset_ref)
             dataset.location = "US"  # Modify if needed
-            self.bq_client.create_dataset(dataset)
+            try:
+                self.bq_client.create_dataset(dataset)
+            except bq_exceptions.Forbidden as e:
+                logger.error(f"Permission Denied: Could not create dataset '{self.dataset_id}' in project '{self.project_id}'.")
+                logger.error("Fix: Grant 'BigQuery User' or 'BigQuery Admin' role to the service account, or manually create the dataset in the Google Cloud Console.")
+                raise e
 
         # 2. Create Table
         table_ref = dataset_ref.table(self.table_id)
