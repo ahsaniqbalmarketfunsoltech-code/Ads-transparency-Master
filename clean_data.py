@@ -395,21 +395,42 @@ class DataCleaner:
                         if yt_id:
                             df_bq.loc[df_bq['video_id'] == vid, 'youtube_url'] = f"https://www.youtube.com/watch?v={yt_id}"
             
-            # 6. Combine: existing BQ data (updated) + new videos
-            if not df_bq.empty:
-                df_bq['last_updated'] = pd.to_datetime(df_bq['last_updated'])
-                if not df_new.empty:
-                    df_final = pd.concat([df_bq, df_new], ignore_index=True)
-                else:
-                    df_final = df_bq
+        # Combine: existing BQ data (updated) + new videos
+        if not df_bq.empty:
+            df_bq['last_updated'] = pd.to_datetime(df_bq['last_updated'])
+            if not df_new.empty:
+                df_final = pd.concat([df_bq, df_new], ignore_index=True)
             else:
-                df_final = df_new
+                df_final = df_bq
         else:
-            logger.info("No videos need YouTube stats. Nothing to update.")
-            return
+            df_final = df_new
 
-        # 7. Upload the full combined dataset back to BigQuery
-        self.upload_to_bq(df_final)
+        if videos_to_fetch:
+            # 5. Fetch YouTube Stats
+            stats_map = self.get_youtube_stats_batch(videos_to_fetch)
+            
+            # Apply stats to NEW videos in the combined dataframe
+            mask_new = df_final['video_id'].isin(df_new['video_id']) if not df_new.empty else pd.Series([False]*len(df_final))
+            df_final.loc[mask_new, 'views'] = df_final.loc[mask_new, 'video_id'].map(lambda x: stats_map.get(x, (0, ""))[0])
+            df_final.loc[mask_new, 'upload_time'] = df_final.loc[mask_new, 'video_id'].map(lambda x: stats_map.get(x, (0, ""))[1])
+            df_final.loc[mask_new, 'last_updated'] = datetime.now(timezone.utc)
+            
+            # Update stats for INCOMPLETE videos in the combined dataframe
+            if not df_incomplete.empty:
+                mask_inc = df_final['video_id'].isin(df_incomplete['video_id'])
+                for vid in df_incomplete['video_id'].tolist():
+                    if vid in stats_map:
+                        views, upload_time = stats_map[vid]
+                        df_final.loc[df_final['video_id'] == vid, 'views'] = views if views else 0
+                        df_final.loc[df_final['video_id'] == vid, 'upload_time'] = upload_time if upload_time else ''
+                        df_final.loc[df_final['video_id'] == vid, 'last_updated'] = datetime.now(timezone.utc)
+
+        # 7. ALWAYS upload the full combined dataset back to BigQuery
+        # This ensuring normalization (URL fixes) happens even if no new stats were fetched
+        if not df_final.empty:
+            self.upload_to_bq(df_final)
+        else:
+            logger.info("No data to sync.")
 
     def upload_to_bq(self, df):
         """Uploads full DataFrame to BigQuery (Free Tier Compatible)"""
