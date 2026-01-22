@@ -147,7 +147,12 @@ class DataCleaner:
             return {vid: self.youtube_cache.get(vid, (None, None)) for vid in video_ids}
 
         logger.info(f"Fetching stats for {len(uncached)} videos from YouTube API...")
+        logger.info(f"Sample IDs: {uncached[:5]}")
         
+        # Mask API key for logging
+        masked_key = f"{YOUTUBE_API_KEY[:4]}...{YOUTUBE_API_KEY[-4:]}" if YOUTUBE_API_KEY else "Missing"
+        logger.info(f"Using YouTube API Key: {masked_key}")
+
         for i in range(0, len(uncached), 50):
             batch = uncached[i:i+50]
             try:
@@ -157,16 +162,19 @@ class DataCleaner:
                     'key': YOUTUBE_API_KEY
                 }
                 resp = requests.get(YOUTUBE_API_URL, params=params, timeout=30)
+                
                 if resp.status_code == 200:
                     data = resp.json()
                     found_ids = set()
                     for item in data.get('items', []):
                         vid = item['id']
-                        views = int(item['statistics']['viewCount']) if 'viewCount' in item['statistics'] else 0
+                        stats = item.get('statistics', {})
+                        views = int(stats.get('viewCount', 0))
                         
                         # Time ago
-                        pub_at = item['snippet']['publishedAt']
-                        time_ago = self.calculate_time_ago(pub_at)
+                        snippet = item.get('snippet', {})
+                        pub_at = snippet.get('publishedAt')
+                        time_ago = self.calculate_time_ago(pub_at) if pub_at else ""
                         
                         self.youtube_cache[vid] = (views, time_ago)
                         found_ids.add(vid)
@@ -175,8 +183,14 @@ class DataCleaner:
                     for vid in batch:
                         if vid not in found_ids:
                             self.youtube_cache[vid] = (None, None)
+                else:
+                    logger.error(f"YouTube API Error: Status {resp.status_code}")
+                    logger.error(f"Response: {resp.text}")
+                    for vid in batch:
+                        self.youtube_cache[vid] = (None, None)
+                        
             except Exception as e:
-                logger.error(f"API Error: {e}")
+                logger.error(f"Request Failure: {e}")
                 for vid in batch:
                     self.youtube_cache[vid] = (None, None)
             
