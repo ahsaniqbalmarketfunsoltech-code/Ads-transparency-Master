@@ -3,3 +3,5 @@ google-auth==2.27.0
 pandas==2.2.0
 numpy==1.26.3
 requests==2.31.0
+google-cloud-bigquery==3.17.1
+db-dtypes==1.2.0
