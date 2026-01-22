@@ -379,6 +379,10 @@ class DataCleaner:
                         df_bq.loc[df_bq['video_id'] == vid, 'views'] = views if views else 0
                         df_bq.loc[df_bq['video_id'] == vid, 'upload_time'] = upload_time if upload_time else ''
                         df_bq.loc[df_bq['video_id'] == vid, 'last_updated'] = datetime.now(timezone.utc)
+                        # Also update youtube_url to proper YouTube link
+                        yt_id = self.hex_to_youtube_id(vid)
+                        if yt_id:
+                            df_bq.loc[df_bq['video_id'] == vid, 'youtube_url'] = f"https://www.youtube.com/watch?v={yt_id}"
             
             # 6. Combine: existing BQ data (updated) + new videos
             if not df_bq.empty:
