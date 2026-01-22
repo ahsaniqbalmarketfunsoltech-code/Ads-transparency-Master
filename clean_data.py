@@ -303,10 +303,10 @@ class DataCleaner:
         self.upload_to_bq(df_new)
 
     def upload_to_bq(self, df):
-        """Uploads DataFrame to BigQuery using a Merge strategy"""
+        """Uploads DataFrame to BigQuery using MERGE for incremental updates"""
         if df.empty: return
 
-        # Load to temporary table
+        # Load to temporary table first
         job_config = bigquery.LoadJobConfig(
             schema=[
                 bigquery.SchemaField("video_id", "STRING"),
@@ -322,14 +322,14 @@ class DataCleaner:
         )
         
         temp_table_id = f"{self.full_table_id}_temp"
-        logger.info(f"Loading {len(df)} rows to temp table {temp_table_id}...")
+        logger.info(f"Loading {len(df)} rows to temp table...")
         
         job = self.bq_client.load_table_from_dataframe(
             df, temp_table_id, job_config=job_config
         )
         job.result()  # Wait for completion
         
-        # Merge Query
+        # MERGE Query - Updates existing rows, inserts new ones
         merge_query = f"""
             MERGE `{self.full_table_id}` T
             USING `{temp_table_id}` S
@@ -344,10 +344,10 @@ class DataCleaner:
                 VALUES (video_id, youtube_url, app_link, app_name, advertiser_name, views, upload_time, last_updated)
         """
         
-        logger.info("Executing MERGE...")
+        logger.info("Executing MERGE (incremental update)...")
         self.bq_client.query(merge_query).result()
         
-        # Cleanup
+        # Cleanup temp table
         self.bq_client.delete_table(temp_table_id, not_found_ok=True)
         logger.info("✓ Sync Complete!")
 
