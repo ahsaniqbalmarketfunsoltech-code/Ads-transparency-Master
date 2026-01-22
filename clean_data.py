@@ -208,9 +208,9 @@ class DataCleaner:
         return rows[1:] # Skip header
 
     def get_bq_state(self):
-        """Get existing video_ids and their view counts from BQ"""
+        """Get ALL existing data from BQ for merge in Python"""
         query = f"""
-            SELECT video_id, views 
+            SELECT video_id, youtube_url, app_link, app_name, advertiser_name, views, upload_time, last_updated
             FROM `{self.full_table_id}` 
         """
         try:
@@ -230,20 +230,17 @@ class DataCleaner:
         # 2. Parse into DataFrame
         data = []
         for row in raw_rows:
-            # Safe index access
             advertiser = row[0] if len(row) > 0 else ''
             url = row[1] if len(row) > 1 else ''
             app_link = row[2] if len(row) > 2 else ''
             app_name = row[3] if len(row) > 3 else ''
             
-            # Filter: Must be valid play store link
             if 'play.google.com' not in app_link:
                 continue
                 
             vid = self.extract_video_id(url)
-            if not vid:
-                # Try getting from column 4 if exists (explicit ID)
-                vid = row[4] if len(row) > 4 else ''
+            if not vid and len(row) > 4:
+                vid = row[4]
                 
             if vid:
                 data.append({
@@ -258,55 +255,49 @@ class DataCleaner:
             logger.info("No valid data found in sheet.")
             return
 
-        df_sheet = pd.DataFrame(data)
-        # Drop duplicates in sheet data (keep last or first? keep first)
-        df_sheet = df_sheet.drop_duplicates(subset=['video_id'])
+        df_sheet = pd.DataFrame(data).drop_duplicates(subset=['video_id'])
         logger.info(f"Found {len(df_sheet)} unique valid videos in Sheet.")
 
-        # 3. Check BQ State
+        # 3. Get Existing Data from BigQuery
         df_bq = self.get_bq_state()
-        existing_ids = set(df_bq['video_id'].values) if not df_bq.empty else set()
         
-        # 4. Identify rows needing processing
-        # New videos: Not in BQ
-        new_mask = ~df_sheet['video_id'].isin(existing_ids)
-        df_new = df_sheet[new_mask].copy()
+        # 4. Identify NEW videos that aren't in BQ yet
+        existing_ids = df_bq['video_id'].tolist() if not df_bq.empty else []
+        df_new = df_sheet[~df_sheet['video_id'].isin(existing_ids)].copy()
         
-        # Incomplete videos: In BQ but views is null (optional: or 0?)
-        # For simplicity, we only fetch for NEW videos to save quota.
-        # If user wants re-scan, we can add logic.
+        logger.info(f"New videos to process for YouTube stats: {len(df_new)}")
         
-        logger.info(f"New videos to process: {len(df_new)}")
-        
-        if df_new.empty:
-            logger.info("No new videos to sync.")
+        if not df_new.empty:
+            # 5. Fetch YouTube Stats ONLY for new videos (saves quota)
+            video_ids = df_new['video_id'].tolist()
+            stats_map = self.get_youtube_stats_batch(video_ids)
+            
+            df_new['views'] = df_new['video_id'].map(lambda x: stats_map.get(x, (0, ""))[0])
+            df_new['upload_time'] = df_new['video_id'].map(lambda x: stats_map.get(x, (0, ""))[1])
+            df_new['last_updated'] = datetime.now(timezone.utc)
+            
+            # 6. Combine with existing BQ data (Merge in Python)
+            # This keeps the old data and adds the new rows
+            if not df_bq.empty:
+                # Ensure date types match
+                df_bq['last_updated'] = pd.to_datetime(df_bq['last_updated'])
+                df_final = pd.concat([df_bq, df_new], ignore_index=True)
+            else:
+                df_final = df_new
+        else:
+            logger.info("No new videos found. Syncing existing sheet metadata to BQ...")
+            # If no new videos, we still might want to update advertiser/app names from sheet
+            # but for now we'll just skip to keep it simple
             return
 
-        # 5. Fetch YouTube Stats for NEW videos
-        video_ids = df_new['video_id'].tolist()
-        
-        # Batch processing
-        stats_map = self.get_youtube_stats_batch(video_ids)
-        
-        # Apply stats
-        df_new['views'] = df_new['video_id'].map(lambda x: stats_map.get(x, (None, None))[0])
-        df_new['upload_time'] = df_new['video_id'].map(lambda x: stats_map.get(x, (None, None))[1])
-        df_new['last_updated'] = datetime.now(timezone.utc)
-        
-        # Clean types
-        df_new['views'] = pd.to_numeric(df_new['views'], errors='coerce').fillna(0).astype(int)
-        
-        # 6. Upload to BigQuery (Merge pattern)
-        # Since these are NEW IDs, we can just INSERT. 
-        # But to be safe against race conditions or partial runs, we use a Temp Table + MERGE.
-        
-        self.upload_to_bq(df_new)
+        # 7. Upload the full combined dataset back to BigQuery
+        # This uses WRITE_TRUNCATE which works on Free Tier (no billing needed)
+        self.upload_to_bq(df_final)
 
     def upload_to_bq(self, df):
-        """Uploads DataFrame to BigQuery using MERGE for incremental updates"""
+        """Uploads full DataFrame to BigQuery (Free Tier Compatible)"""
         if df.empty: return
 
-        # Load to temporary table first
         job_config = bigquery.LoadJobConfig(
             schema=[
                 bigquery.SchemaField("video_id", "STRING"),
@@ -318,38 +309,13 @@ class DataCleaner:
                 bigquery.SchemaField("upload_time", "STRING"),
                 bigquery.SchemaField("last_updated", "TIMESTAMP"),
             ],
-            write_disposition="WRITE_TRUNCATE"
+            write_disposition="WRITE_TRUNCATE" # Overwrites table with the full combined data
         )
         
-        temp_table_id = f"{self.full_table_id}_temp"
-        logger.info(f"Loading {len(df)} rows to temp table...")
-        
-        job = self.bq_client.load_table_from_dataframe(
-            df, temp_table_id, job_config=job_config
-        )
-        job.result()  # Wait for completion
-        
-        # MERGE Query - Updates existing rows, inserts new ones
-        merge_query = f"""
-            MERGE `{self.full_table_id}` T
-            USING `{temp_table_id}` S
-            ON T.video_id = S.video_id
-            WHEN MATCHED THEN
-                UPDATE SET 
-                    views = S.views,
-                    upload_time = S.upload_time,
-                    last_updated = S.last_updated
-            WHEN NOT MATCHED THEN
-                INSERT (video_id, youtube_url, app_link, app_name, advertiser_name, views, upload_time, last_updated)
-                VALUES (video_id, youtube_url, app_link, app_name, advertiser_name, views, upload_time, last_updated)
-        """
-        
-        logger.info("Executing MERGE (incremental update)...")
-        self.bq_client.query(merge_query).result()
-        
-        # Cleanup temp table
-        self.bq_client.delete_table(temp_table_id, not_found_ok=True)
-        logger.info("✓ Sync Complete!")
+        logger.info(f"Uploading {len(df)} total rows to {self.full_table_id}...")
+        job = self.bq_client.load_table_from_dataframe(df, self.full_table_id, job_config=job_config)
+        job.result()
+        logger.info("✓ BigQuery Sync Complete!")
 
 def main():
     creds = os.getenv('GOOGLE_CREDENTIALS')
