@@ -94,8 +94,8 @@ class SheetCombiner:
                 spreadsheet = self.client.open_by_key(source['sheet_id'])
                 worksheet = spreadsheet.worksheet(source['tab_name'])
                 
-                # Get all values (skip header row)
-                data = worksheet.get_all_values()
+                # Get only columns A through E (skip header row later)
+                data = worksheet.get('A:E')
                 
                 if not data:
                     logger.warning(f"  No data found in '{source['tab_name']}'")
