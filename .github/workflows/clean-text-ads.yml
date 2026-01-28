@@ -1,0 +1,42 @@
+# .github/workflows/clean-text-ads.yml
+name: Clean Text Ads Data
+
+on:
+  schedule:
+    # Runs every hour at minute 45 (15 mins after clean-data.yml)
+    - cron: '45 * * * *'
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  clean-text-ads:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run text ads cleaner
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          # The script uses the hardcoded sheet ID from requirements but matches the env var naming for consistency
+          MASTER_SPREADSHEET_ID: '1yq2UwI94lwfYPY86CFwGbBsm3kpdqKrefYgrw3lEAwk'
+        run: python clean_text_ads.py
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-text-ads-logs
+          path: logs/
+          retention-days: 7
