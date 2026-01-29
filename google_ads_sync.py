@@ -257,7 +257,7 @@ class GoogleAdsVideoSync:
         if df_ads.empty:
             logger.info("None of the videos in Google Ads match the BigQuery database.")
             return
-+
+
         # Group and sum metrics
         agg_functions = {
             'impressions': 'sum',
