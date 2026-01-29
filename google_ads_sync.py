@@ -93,9 +93,22 @@ class GoogleAdsVideoSync:
         """Fetch all client account IDs, handling Manager accounts"""
         all_client_ids = set()
         
+        # Priority 0: Use explicitly provided customer IDs from environment
+        customer_ids_env = os.getenv('GOOGLE_ADS_CUSTOMER_IDS', '')
+        if customer_ids_env:
+            # Parse comma-separated list of customer IDs
+            explicit_ids = [cid.strip().replace("-", "") for cid in customer_ids_env.split(',') if cid.strip()]
+            logger.info(f"Using {len(explicit_ids)} customer IDs from GOOGLE_ADS_CUSTOMER_IDS environment variable.")
+            all_client_ids.update(explicit_ids)
+            # Also check for sub-accounts under each
+            for cid in explicit_ids:
+                clients = self.get_client_accounts(cid)
+                if clients:
+                    all_client_ids.update(clients)
+        
         # Priority 1: Use login_customer_id if provided
         login_id = self.ads_config.get("login_customer_id")
-        if login_id:
+        if login_id and not customer_ids_env:
             cid = str(login_id).replace("-", "")
             logger.info(f"Using login_customer_id {cid} as starting point.")
             all_client_ids.add(cid)
@@ -104,24 +117,25 @@ class GoogleAdsVideoSync:
             if clients:
                 all_client_ids.update(clients)
 
-        # Priority 2: Try Listing all accessible customers
-        try:
-            customer_service = self.ads_client.get_service("CustomerService", version="v18")
-            customer_resource_names = customer_service.list_accessible_customers()
-            
-            for resource_name in customer_resource_names.resource_names:
-                cid = resource_name.split("/")[-1]
-                if cid not in all_client_ids:
-                    # Check if this is a manager or a client
-                    clients = self.get_client_accounts(cid)
-                    if clients:
-                        all_client_ids.update(clients)
-                    else:
-                        all_client_ids.add(cid)
-        except Exception as e:
-            logger.warning(f"Could not list all accessible customers: {e}")
-            if not all_client_ids:
-                logger.error("No accounts found via ListAccessibleCustomers or login_customer_id.")
+        # Priority 2: Try Listing all accessible customers (only if no IDs provided)
+        if not all_client_ids:
+            try:
+                customer_service = self.ads_client.get_service("CustomerService", version="v18")
+                customer_resource_names = customer_service.list_accessible_customers()
+                
+                for resource_name in customer_resource_names.resource_names:
+                    cid = resource_name.split("/")[-1]
+                    if cid not in all_client_ids:
+                        # Check if this is a manager or a client
+                        clients = self.get_client_accounts(cid)
+                        if clients:
+                            all_client_ids.update(clients)
+                        else:
+                            all_client_ids.add(cid)
+            except Exception as e:
+                logger.warning(f"Could not list all accessible customers: {e}")
+                if not all_client_ids:
+                    logger.error("No accounts found. Please set GOOGLE_ADS_CUSTOMER_IDS environment variable with comma-separated account IDs.")
         
         logger.info(f"Total client accounts to process: {len(all_client_ids)}")
         return list(all_client_ids)
