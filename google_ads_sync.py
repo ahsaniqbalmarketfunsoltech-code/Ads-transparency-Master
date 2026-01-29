@@ -219,8 +219,127 @@ class GoogleAdsVideoSync:
         else:
             logger.info(f"      No assets found in account")
         
+        # Query 4: Look for videos INSIDE app_ad structure (App Campaigns)
+        query4 = """
+            SELECT
+              ad_group_ad.ad.app_ad.youtube_videos,
+              ad_group_ad.ad.id,
+              ad_group.id,
+              ad_group.name,
+              campaign.id,
+              campaign.name,
+              campaign.app_campaign_setting.app_id,
+              customer.id,
+              customer.descriptive_name,
+              metrics.impressions,
+              metrics.clicks,
+              metrics.cost_micros
+            FROM ad_group_ad
+            WHERE ad_group_ad.ad.type = 'APP_AD'
+        """
+        
+        logger.info(f"    Query 4: Looking for videos in APP_AD structure...")
+        result4 = self.search(query4, customer_id)
+        
+        if result4['result'] and result4['response']:
+            logger.info(f"      Raw APP_AD rows: {len(result4['response'])}")
+            for row in result4['response']:
+                self._process_app_ad_row(row, stats, seen_keys, 'app_ad')
+        else:
+            logger.info(f"      No APP_AD data found")
+        
+        # Query 5: Look for videos INSIDE app_engagement_ad structure
+        query5 = """
+            SELECT
+              ad_group_ad.ad.app_engagement_ad.videos,
+              ad_group_ad.ad.id,
+              ad_group.id,
+              ad_group.name,
+              campaign.id,
+              campaign.name,
+              campaign.app_campaign_setting.app_id,
+              customer.id,
+              customer.descriptive_name,
+              metrics.impressions,
+              metrics.clicks,
+              metrics.cost_micros
+            FROM ad_group_ad
+            WHERE ad_group_ad.ad.type = 'APP_ENGAGEMENT_AD'
+        """
+        
+        logger.info(f"    Query 5: Looking for videos in APP_ENGAGEMENT_AD structure...")
+        result5 = self.search(query5, customer_id)
+        
+        if result5['result'] and result5['response']:
+            logger.info(f"      Raw APP_ENGAGEMENT_AD rows: {len(result5['response'])}")
+            for row in result5['response']:
+                self._process_app_ad_row(row, stats, seen_keys, 'app_engagement_ad')
+        else:
+            logger.info(f"      No APP_ENGAGEMENT_AD data found")
+        
         logger.info(f"    Total video stats for this customer: {len(stats)}")
         return stats
+
+    def _process_app_ad_row(self, row, stats, seen_keys, source):
+        """Process app_ad or app_engagement_ad row to extract videos"""
+        try:
+            ad_group_ad = row.get('adGroupAd', {})
+            ad = ad_group_ad.get('ad', {})
+            campaign = row.get('campaign', {})
+            metrics = row.get('metrics', {})
+            customer = row.get('customer', {})
+            ad_group = row.get('adGroup', {})
+            
+            # Get videos from the ad structure
+            videos = []
+            if source == 'app_ad':
+                app_ad = ad.get('appAd', {})
+                videos = app_ad.get('youtubeVideos', [])
+            else:  # app_engagement_ad
+                app_engagement_ad = ad.get('appEngagementAd', {})
+                videos = app_engagement_ad.get('videos', [])
+            
+            if not videos:
+                return
+            
+            logger.info(f"        Found {len(videos)} videos in ad {ad.get('id', 'N/A')}")
+            
+            for video in videos:
+                # Video is a reference to an asset
+                asset_resource = video.get('asset', '')
+                
+                # Create dedup key
+                key = (
+                    str(customer.get('id', '')),
+                    str(campaign.get('id', '')),
+                    str(ad_group.get('id', '')),
+                    asset_resource
+                )
+                
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                
+                stats.append({
+                    'youtube_id': asset_resource,  # This is the asset resource name, we'll need to resolve it
+                    'package_id': campaign.get('appCampaignSetting', {}).get('appId', 'N/A'),
+                    'campaign_id': str(campaign.get('id', '')),
+                    'campaign_name': campaign.get('name', ''),
+                    'impressions': int(metrics.get('impressions', 0)),
+                    'clicks': int(metrics.get('clicks', 0)),
+                    'cost': float(metrics.get('costMicros', 0)) / 1000000.0,
+                    'account_id': str(customer.get('id', '')),
+                    'account_name': customer.get('descriptiveName', ''),
+                    'ad_group_id': str(ad_group.get('id', '')),
+                    'ad_group_name': ad_group.get('name', ''),
+                    'source': source,
+                    'asset_resource': asset_resource
+                })
+                
+                logger.info(f"          Video asset: {asset_resource}")
+                
+        except Exception as e:
+            logger.warning(f"Error parsing app ad row: {e}")
 
     def _process_video_row(self, row, stats, seen_keys, source):
         """Process a video row from Google Ads API response"""
