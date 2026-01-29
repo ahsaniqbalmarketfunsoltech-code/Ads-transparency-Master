@@ -1,7 +1,7 @@
 """
 Google Ads Video Performance Sync
 Fetches video performance stats from Google Ads and updates clean_ads_transparency table.
-Matches using youtube_url column and includes asset status.
+Uses batch MERGE for fast updates.
 """
 
 import os
@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 from google.cloud import bigquery
 
-# Setup logging - minimal output
+# Setup logging
 Path("logs").mkdir(exist_ok=True)
 log_filename = f"logs/google_ads_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 logging.basicConfig(
@@ -130,20 +130,14 @@ class GoogleAdsVideoSync:
         stats = []
         seen_keys = set()
         
-        # Get asset -> YouTube ID and status mapping
         asset_map = self.get_asset_info_map(customer_id)
         
-        # Query APP_AD structure for videos with ad status
+        # Query APP_AD
         query = """
             SELECT
               ad_group_ad.ad.app_ad.youtube_videos,
-              ad_group_ad.ad.id,
               ad_group_ad.status,
-              ad_group.id,
-              ad_group.name,
               ad_group.status,
-              campaign.id,
-              campaign.name,
               campaign.status,
               campaign.app_campaign_setting.app_id,
               customer.id,
@@ -156,22 +150,16 @@ class GoogleAdsVideoSync:
         """
         
         result = self.search(query, customer_id)
-        
         if result['result'] and result['response']:
             for row in result['response']:
-                self._process_app_ad_row(row, stats, seen_keys, asset_map)
+                self._process_row(row, stats, seen_keys, asset_map, 'appAd', 'youtubeVideos')
         
-        # Also check APP_ENGAGEMENT_AD
+        # Query APP_ENGAGEMENT_AD
         query2 = """
             SELECT
               ad_group_ad.ad.app_engagement_ad.videos,
-              ad_group_ad.ad.id,
               ad_group_ad.status,
-              ad_group.id,
-              ad_group.name,
               ad_group.status,
-              campaign.id,
-              campaign.name,
               campaign.status,
               campaign.app_campaign_setting.app_id,
               customer.id,
@@ -186,12 +174,12 @@ class GoogleAdsVideoSync:
         result2 = self.search(query2, customer_id)
         if result2['result'] and result2['response']:
             for row in result2['response']:
-                self._process_app_ad_row(row, stats, seen_keys, asset_map, is_engagement=True)
+                self._process_row(row, stats, seen_keys, asset_map, 'appEngagementAd', 'videos')
         
         return stats
 
-    def _process_app_ad_row(self, row, stats, seen_keys, asset_map, is_engagement=False):
-        """Process app_ad row to extract video stats with status"""
+    def _process_row(self, row, stats, seen_keys, asset_map, ad_key, video_key):
+        """Process row to extract video stats"""
         try:
             ad_group_ad = row.get('adGroupAd', {})
             ad = ad_group_ad.get('ad', {})
@@ -202,26 +190,18 @@ class GoogleAdsVideoSync:
             
             # Get statuses
             ad_status = ad_group_ad.get('status', 'UNKNOWN')
-            ad_group_status = ad_group.get('status', 'UNKNOWN')
-            campaign_status = campaign.get('status', 'UNKNOWN')
+            ag_status = ad_group.get('status', 'UNKNOWN')
+            c_status = campaign.get('status', 'UNKNOWN')
             
             # Determine effective status
-            # If any level is REMOVED, the video is removed
-            # If all are ENABLED, it's running
-            # Otherwise it's PAUSED
-            if ad_status == 'REMOVED' or ad_group_status == 'REMOVED' or campaign_status == 'REMOVED':
+            if 'REMOVED' in [ad_status, ag_status, c_status]:
                 effective_status = 'REMOVED'
-            elif ad_status == 'ENABLED' and ad_group_status == 'ENABLED' and campaign_status == 'ENABLED':
+            elif ad_status == 'ENABLED' and ag_status == 'ENABLED' and c_status == 'ENABLED':
                 effective_status = 'RUNNING'
             else:
                 effective_status = 'PAUSED'
             
-            # Get videos from the ad structure
-            if is_engagement:
-                videos = ad.get('appEngagementAd', {}).get('videos', [])
-            else:
-                videos = ad.get('appAd', {}).get('youtubeVideos', [])
-            
+            videos = ad.get(ad_key, {}).get(video_key, [])
             if not videos:
                 return
             
@@ -229,23 +209,19 @@ class GoogleAdsVideoSync:
                 asset_resource = video.get('asset', '')
                 asset_info = asset_map.get(asset_resource, {})
                 youtube_id = asset_info.get('youtube_id')
-                approval_status = asset_info.get('approval_status', 'UNKNOWN')
                 
                 if not youtube_id:
                     continue
                 
-                # Build YouTube URL for matching
                 youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
                 
-                key = (youtube_url,)  # Dedupe by YouTube URL
-                if key in seen_keys:
-                    # Aggregate metrics for same video
+                if youtube_url in seen_keys:
+                    # Aggregate
                     for stat in stats:
                         if stat['youtube_url'] == youtube_url:
                             stat['impressions'] += int(metrics.get('impressions', 0))
                             stat['clicks'] += int(metrics.get('clicks', 0))
                             stat['cost'] += float(metrics.get('costMicros', 0)) / 1000000.0
-                            # Keep the best status (RUNNING > PAUSED > REMOVED)
                             if effective_status == 'RUNNING':
                                 stat['status'] = 'RUNNING'
                             elif effective_status == 'PAUSED' and stat['status'] != 'RUNNING':
@@ -253,26 +229,22 @@ class GoogleAdsVideoSync:
                             break
                     continue
                 
-                seen_keys.add(key)
+                seen_keys.add(youtube_url)
                 
                 stats.append({
-                    'youtube_id': youtube_id,
                     'youtube_url': youtube_url,
-                    'package_id': campaign.get('appCampaignSetting', {}).get('appId', 'N/A'),
                     'impressions': int(metrics.get('impressions', 0)),
                     'clicks': int(metrics.get('clicks', 0)),
                     'cost': float(metrics.get('costMicros', 0)) / 1000000.0,
-                    'account_id': str(customer.get('id', '')),
                     'account_name': customer.get('descriptiveName', ''),
-                    'status': effective_status,
-                    'approval_status': approval_status
+                    'status': effective_status
                 })
-        except Exception as e:
-            pass  # Silent fail for individual rows
+        except:
+            pass
 
     def ensure_columns_exist(self):
-        """Add Google Ads columns to clean_ads_transparency if they don't exist"""
-        columns_to_add = [
+        """Add Google Ads columns if they don't exist"""
+        columns = [
             ("google_ads_impressions", "INTEGER"),
             ("google_ads_clicks", "INTEGER"),
             ("google_ads_cost", "FLOAT64"),
@@ -281,11 +253,11 @@ class GoogleAdsVideoSync:
             ("google_ads_last_sync", "TIMESTAMP")
         ]
         
-        for col_name, col_type in columns_to_add:
+        for col_name, col_type in columns:
             try:
-                alter_query = f"ALTER TABLE `{self.full_table_id}` ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-                self.bq_client.query(alter_query).result()
-            except Exception as e:
+                q = f"ALTER TABLE `{self.full_table_id}` ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                self.bq_client.query(q).result()
+            except:
                 pass
         
         logger.info("✓ Ensured Google Ads columns exist")
@@ -295,14 +267,11 @@ class GoogleAdsVideoSync:
         logger.info("Google Ads Video Sync Started")
         logger.info("=" * 50)
         
-        # Ensure columns exist in main table
         self.ensure_columns_exist()
         
-        # Load youtube_url from BigQuery
+        # Load youtube_urls from BigQuery
         query = f"SELECT youtube_url FROM `{self.full_table_id}` WHERE youtube_url IS NOT NULL"
         df_videos = self.bq_client.query(query).to_dataframe()
-        
-        # Create set of valid YouTube URLs for matching
         valid_urls = set(df_videos['youtube_url'].dropna().tolist())
         logger.info(f"📊 Loaded {len(valid_urls)} videos from BigQuery")
         
@@ -315,7 +284,7 @@ class GoogleAdsVideoSync:
         customer_ids = [cid.strip().replace("-", "") for cid in customer_ids_env.split(',') if cid.strip()]
         logger.info(f"🔍 Processing {len(customer_ids)} Google Ads accounts...")
         
-        # Fetch video stats from all accounts
+        # Fetch video stats
         all_stats = []
         for i, cid in enumerate(customer_ids, 1):
             stats = self.get_video_stats(cid)
@@ -323,78 +292,84 @@ class GoogleAdsVideoSync:
             logger.info(f"   Account {i}/{len(customer_ids)}: {cid} → {len(stats)} videos")
         
         if not all_stats:
-            logger.info("⚠️ No video stats found in Google Ads")
+            logger.info("⚠️ No video stats found")
             return
         
         logger.info(f"📈 Total raw stats: {len(all_stats)}")
         
-        # Convert to DataFrame
+        # Convert to DataFrame and filter
         df_ads = pd.DataFrame(all_stats)
-        
-        # Filter to only include videos that exist in BigQuery
         df_ads = df_ads[df_ads['youtube_url'].isin(valid_urls)]
         
         if df_ads.empty:
-            logger.info("⚠️ No matching videos found in BigQuery")
+            logger.info("⚠️ No matching videos found")
             return
         
-        logger.info(f"✓ Matched {len(df_ads)} stats with BigQuery data")
+        logger.info(f"✓ Matched {len(df_ads)} stats with BigQuery")
         
         # Aggregate by youtube_url
         def agg_status(x):
-            # Priority: RUNNING > PAUSED > REMOVED
             if 'RUNNING' in x.values:
                 return 'RUNNING'
             elif 'PAUSED' in x.values:
                 return 'PAUSED'
-            else:
-                return 'REMOVED'
+            return 'REMOVED'
         
-        agg_functions = {
+        df_agg = df_ads.groupby('youtube_url').agg({
             'impressions': 'sum',
             'clicks': 'sum',
             'cost': 'sum',
             'account_name': lambda x: ', '.join(sorted(set(str(v) for v in x if v))),
             'status': agg_status
-        }
-        df_agg = df_ads.groupby('youtube_url').agg(agg_functions).reset_index()
+        }).reset_index()
         
         logger.info(f"📊 Aggregated to {len(df_agg)} unique videos")
         
-        # Count by status
         status_counts = df_agg['status'].value_counts().to_dict()
-        logger.info(f"   Status breakdown: {status_counts}")
+        logger.info(f"   Status: {status_counts}")
         
-        # Update matching rows in clean_ads_transparency
-        logger.info("💾 Updating clean_ads_transparency table...")
+        # Upload to temp table then MERGE (much faster than individual updates)
+        logger.info("💾 Uploading to temp table...")
         
-        updates_done = 0
-        for _, row in df_agg.iterrows():
-            youtube_url = row['youtube_url'].replace("'", "\\'")
-            impressions = int(row['impressions'])
-            clicks = int(row['clicks'])
-            cost = float(row['cost'])
-            accounts = str(row['account_name']).replace("'", "\\'")
-            status = row['status']
-            
-            update_query = f"""
-                UPDATE `{self.full_table_id}`
-                SET 
-                    google_ads_impressions = {impressions},
-                    google_ads_clicks = {clicks},
-                    google_ads_cost = {cost},
-                    google_ads_accounts = '{accounts}',
-                    google_ads_status = '{status}',
-                    google_ads_last_sync = CURRENT_TIMESTAMP()
-                WHERE youtube_url = '{youtube_url}'
-            """
-            try:
-                self.bq_client.query(update_query).result()
-                updates_done += 1
-            except Exception as e:
-                pass  # Silent fail for individual updates
+        temp_table_id = f"{self.bq_client.project}.{self.dataset_id}.temp_google_ads_stats"
         
-        logger.info(f"✓ Updated {updates_done} videos in clean_ads_transparency")
+        # Prepare DataFrame for upload
+        df_upload = df_agg.rename(columns={
+            'impressions': 'google_ads_impressions',
+            'clicks': 'google_ads_clicks',
+            'cost': 'google_ads_cost',
+            'account_name': 'google_ads_accounts',
+            'status': 'google_ads_status'
+        })
+        
+        # Upload to temp table
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+        job = self.bq_client.load_table_from_dataframe(df_upload, temp_table_id, job_config=job_config)
+        job.result()
+        
+        logger.info("💾 Merging into main table...")
+        
+        # MERGE statement - single fast operation
+        merge_query = f"""
+            MERGE `{self.full_table_id}` T
+            USING `{temp_table_id}` S
+            ON T.youtube_url = S.youtube_url
+            WHEN MATCHED THEN
+                UPDATE SET
+                    T.google_ads_impressions = S.google_ads_impressions,
+                    T.google_ads_clicks = S.google_ads_clicks,
+                    T.google_ads_cost = S.google_ads_cost,
+                    T.google_ads_accounts = S.google_ads_accounts,
+                    T.google_ads_status = S.google_ads_status,
+                    T.google_ads_last_sync = CURRENT_TIMESTAMP()
+        """
+        
+        self.bq_client.query(merge_query).result()
+        
+        # Clean up temp table
+        self.bq_client.delete_table(temp_table_id, not_found_ok=True)
+        
+        logger.info(f"✓ Updated {len(df_agg)} videos in clean_ads_transparency")
         logger.info("=" * 50)
         logger.info("✅ Google Ads Sync Complete!")
         logger.info("=" * 50)
