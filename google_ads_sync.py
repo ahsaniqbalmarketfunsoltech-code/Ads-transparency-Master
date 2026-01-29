@@ -118,16 +118,21 @@ class GoogleAdsVideoSync:
 
     def search_google_ads(self, customer_id, query):
         """Execute a GAQL query using REST API"""
-        # Correct endpoint format for Google Ads REST API
-        url = f"https://googleads.googleapis.com/{self.api_version}/customers/{customer_id}/googleAds:searchStream"
+        # Use the regular search endpoint (not stream)
+        url = f"https://googleads.googleapis.com/{self.api_version}/customers/{customer_id}/googleAds:search"
         
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "developer-token": self.developer_token,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Accept": "application/json"
         }
         
-        data = {"query": query}
+        # For the regular search endpoint, we need pageSize
+        data = {
+            "query": query,
+            "pageSize": 10000
+        }
         
         logger.info(f"    Calling: {url}")
         
@@ -137,21 +142,17 @@ class GoogleAdsVideoSync:
             logger.info(f"    API Response Status: {response.status_code}")
             
             if response.status_code == 200:
-                results = response.json()
-                # searchStream returns an array of result batches
-                all_results = []
-                for batch in results:
-                    if "results" in batch:
-                        all_results.extend(batch["results"])
+                result = response.json()
+                all_results = result.get("results", [])
                 logger.info(f"    Rows returned: {len(all_results)}")
                 return all_results
             else:
                 # Log the actual error message
                 try:
                     error_json = response.json()
-                    error_msg = json.dumps(error_json, indent=2)[:1000]
+                    error_msg = json.dumps(error_json, indent=2)[:1500]
                 except:
-                    error_msg = response.text[:1000] if response.text else "No error message"
+                    error_msg = response.text[:1500] if response.text else "No error message"
                 logger.warning(f"    API Error: {error_msg}")
                 return []
         except Exception as e:
