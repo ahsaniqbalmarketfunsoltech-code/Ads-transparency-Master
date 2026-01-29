@@ -1,19 +1,32 @@
+"""
+Google Ads Video Performance Sync (REST API Version)
+Uses direct REST API calls instead of the google-ads Python library to avoid gRPC issues.
+"""
+
 import os
 import json
 import logging
-import time
-from datetime import datetime, timezone
-from google.ads.googleads.client import GoogleAdsClient
-from google.cloud import bigquery
-import pandas as pd
 import base64
+from datetime import datetime
+from pathlib import Path
+import requests
+import pandas as pd
+from google.cloud import bigquery
+from google.oauth2.credentials import Credentials
 
 # Setup logging
+Path("logs").mkdir(exist_ok=True)
+log_filename = f"logs/google_ads_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_filename)
+    ]
 )
 logger = logging.getLogger(__name__)
+logger.info("Google Ads Sync script initialized")
 
 class GoogleAdsVideoSync:
     def __init__(self):
@@ -28,28 +41,70 @@ class GoogleAdsVideoSync:
         self.table_id = os.getenv('BIGQUERY_TABLE', 'clean_ads_transparency')
         self.full_table_id = f"{self.bq_client.project}.{self.dataset_id}.{self.table_id}"
 
-        # Google Ads Config
-        # We expect a JSON string for GOOGLE_ADS_CONFIG or individual env vars
-        ads_config_json = os.getenv('GOOGLE_ADS_CONFIG')
-        if ads_config_json:
-            self.ads_config = json.loads(ads_config_json)
-        else:
-            self.ads_config = {
-                "client_id": os.getenv('GOOGLE_ADS_CLIENT_ID'),
-                "client_secret": os.getenv('GOOGLE_ADS_CLIENT_SECRET'),
-                "refresh_token": os.getenv('GOOGLE_ADS_REFRESH_TOKEN'),
-                "developer_token": os.getenv('GOOGLE_ADS_DEVELOPER_TOKEN'),
-                "use_proto_plus": False,
-                "transport": "rest"
-            }
-            if os.getenv('GOOGLE_ADS_LOGIN_CUSTOMER_ID'):
-                self.ads_config["login_customer_id"] = os.getenv('GOOGLE_ADS_LOGIN_CUSTOMER_ID')
+        # Google Ads REST API Config
+        self.developer_token = os.getenv('GOOGLE_ADS_DEVELOPER_TOKEN')
+        self.client_id = os.getenv('GOOGLE_ADS_CLIENT_ID')
+        self.client_secret = os.getenv('GOOGLE_ADS_CLIENT_SECRET')
+        self.refresh_token = os.getenv('GOOGLE_ADS_REFRESH_TOKEN')
+        
+        if not all([self.developer_token, self.client_id, self.client_secret, self.refresh_token]):
+            raise ValueError("Missing Google Ads credentials")
+        
+        # Get access token
+        self.access_token = self._get_access_token()
+        
+        # API base URL
+        self.api_version = "v18"
+        self.base_url = f"https://googleads.googleapis.com/{self.api_version}"
 
-        self.ads_client = GoogleAdsClient.load_from_dict(self.ads_config)
+    def _get_access_token(self):
+        """Get access token using refresh token"""
+        token_url = "https://oauth2.googleapis.com/token"
+        data = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "refresh_token": self.refresh_token,
+            "grant_type": "refresh_token"
+        }
+        response = requests.post(token_url, data=data)
+        if response.status_code != 200:
+            logger.error(f"Failed to get access token: {response.text}")
+            raise Exception("Failed to authenticate with Google")
+        
+        return response.json()["access_token"]
+
+    def _make_request(self, endpoint, method="GET", data=None, customer_id=None):
+        """Make REST API request to Google Ads"""
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "developer-token": self.developer_token,
+            "Content-Type": "application/json"
+        }
+        
+        if customer_id:
+            headers["login-customer-id"] = customer_id
+        
+        url = f"{self.base_url}/{endpoint}"
+        
+        try:
+            if method == "GET":
+                response = requests.get(url, headers=headers)
+            else:
+                response = requests.post(url, headers=headers, json=data)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.debug(f"API Error ({response.status_code}): {response.text[:500]}")
+                return None
+        except Exception as e:
+            logger.debug(f"Request failed: {e}")
+            return None
 
     def hex_to_youtube_id(self, hex_id):
         """Standard conversion used in clean_data.py"""
-        if not hex_id or len(hex_id) < 10: return None
+        if not hex_id or len(hex_id) < 10:
+            return None
         try:
             video_bytes = bytes.fromhex(hex_id.strip().lower())
             b64 = base64.b64encode(video_bytes).decode('utf-8')
@@ -57,120 +112,47 @@ class GoogleAdsVideoSync:
         except:
             return None
 
-    def get_client_accounts(self, customer_id):
-        """Recursively find all client accounts under a manager account"""
-        # Force v18 for better compatibility
-        ga_service = self.ads_client.get_service("GoogleAdsService", version="v18")
-        query = """
-            SELECT
-              customer_client.client_customer,
-              customer_client.level,
-              customer_client.manager,
-              customer_client.descriptive_name,
-              customer_client.id
-            FROM customer_client
-            WHERE customer_client.level <= 1
-              AND customer_client.status = 'ENABLED'
-        """
+    def search_google_ads(self, customer_id, query):
+        """Execute a GAQL query using REST API"""
+        endpoint = f"customers/{customer_id}/googleAds:searchStream"
+        data = {"query": query}
         
-        client_ids = []
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "developer-token": self.developer_token,
+            "Content-Type": "application/json"
+        }
+        
+        url = f"{self.base_url}/{endpoint}"
+        
         try:
-            search_request = self.ads_client.get_type("SearchGoogleAdsRequest", version="v18")
-            search_request.customer_id = str(customer_id).replace("-", "")
-            search_request.query = query
-            response = ga_service.search(request=search_request)
+            response = requests.post(url, headers=headers, json=data)
             
-            for row in response:
-                client = row.customer_client
-                if not client.manager:
-                    client_ids.append(str(client.id))
+            if response.status_code == 200:
+                results = response.json()
+                # searchStream returns an array of result batches
+                all_results = []
+                for batch in results:
+                    if "results" in batch:
+                        all_results.extend(batch["results"])
+                return all_results
+            else:
+                error_text = response.text[:500] if response.text else "No error message"
+                logger.debug(f"Search failed for {customer_id}: {response.status_code} - {error_text}")
+                return []
         except Exception as e:
-            logger.debug(f"Error listing clients for customer {customer_id}: {e}")
-            
-        return client_ids
-
-    def get_accessible_customers(self):
-        """Fetch all client account IDs, handling Manager accounts"""
-        all_client_ids = set()
-        
-        # Priority 0: Use explicitly provided customer IDs from environment
-        customer_ids_env = os.getenv('GOOGLE_ADS_CUSTOMER_IDS', '')
-        if customer_ids_env:
-            # Parse comma-separated list of customer IDs
-            explicit_ids = [cid.strip().replace("-", "") for cid in customer_ids_env.split(',') if cid.strip()]
-            logger.info(f"Using {len(explicit_ids)} customer IDs from GOOGLE_ADS_CUSTOMER_IDS environment variable.")
-            all_client_ids.update(explicit_ids)
-            # Also check for sub-accounts under each
-            for cid in explicit_ids:
-                clients = self.get_client_accounts(cid)
-                if clients:
-                    all_client_ids.update(clients)
-        
-        # Priority 1: Use login_customer_id if provided
-        login_id = self.ads_config.get("login_customer_id")
-        if login_id and not customer_ids_env:
-            cid = str(login_id).replace("-", "")
-            logger.info(f"Using login_customer_id {cid} as starting point.")
-            all_client_ids.add(cid)
-            # Find sub-accounts if it's a manager
-            clients = self.get_client_accounts(cid)
-            if clients:
-                all_client_ids.update(clients)
-
-        # Priority 2: Try Listing all accessible customers (only if no IDs provided)
-        if not all_client_ids:
-            try:
-                customer_service = self.ads_client.get_service("CustomerService", version="v18")
-                customer_resource_names = customer_service.list_accessible_customers()
-                
-                for resource_name in customer_resource_names.resource_names:
-                    cid = resource_name.split("/")[-1]
-                    if cid not in all_client_ids:
-                        # Check if this is a manager or a client
-                        clients = self.get_client_accounts(cid)
-                        if clients:
-                            all_client_ids.update(clients)
-                        else:
-                            all_client_ids.add(cid)
-            except Exception as e:
-                logger.warning(f"Could not list all accessible customers: {e}")
-                if not all_client_ids:
-                    logger.error("No accounts found. Please set GOOGLE_ADS_CUSTOMER_IDS environment variable with comma-separated account IDs.")
-        
-        logger.info(f"Total client accounts to process: {len(all_client_ids)}")
-        return list(all_client_ids)
+            logger.debug(f"Search exception for {customer_id}: {e}")
+            return []
 
     def get_video_stats(self, customer_id):
-        """Query Google Ads for video stats including package ID (app_id)"""
-        ga_service = self.ads_client.get_service("GoogleAdsService", version="v18")
+        """Query Google Ads for video stats using REST API"""
         stats = []
         
-        # Query: Assets linked to campaigns or ad groups
-        # This covers App Campaigns and modern Video Ads (Responsive Video Ads)
+        # Query for campaign-level assets
         query = """
             SELECT
               asset.youtube_video_asset.youtube_video_id,
-              campaign.app_campaign_settings.app_id,
-              campaign.id,
-              campaign.name,
-              ad_group.id,
-              ad_group.name,
-              metrics.impressions,
-              metrics.clicks,
-              metrics.cost_micros,
-              metrics.conversions,
-              metrics.video_views,
-              customer.id,
-              customer.descriptive_name
-            FROM ad_group_asset
-            WHERE asset.type = 'YOUTUBE_VIDEO'
-              AND metrics.impressions > 0
-        """
-        # Note: If no assets are at ad_group level, we also check campaign level
-        query_campaign = """
-            SELECT
-              asset.youtube_video_asset.youtube_video_id,
-              campaign.app_campaign_settings.app_id,
+              campaign.app_campaign_setting.app_id,
               campaign.id,
               campaign.name,
               metrics.impressions,
@@ -185,97 +167,105 @@ class GoogleAdsVideoSync:
               AND metrics.impressions > 0
         """
         
-        for q in [query, query_campaign]:
+        results = self.search_google_ads(customer_id, query)
+        
+        for row in results:
             try:
-                search_request = self.ads_client.get_type("SearchGoogleAdsRequest", version="v18")
-                search_request.customer_id = str(customer_id).replace("-", "")
-                search_request.query = q
+                asset = row.get("asset", {})
+                campaign = row.get("campaign", {})
+                metrics = row.get("metrics", {})
+                customer = row.get("customer", {})
                 
-                response = ga_service.search(request=search_request)
-                for row in response:
-                    pkg_id = row.campaign.app_campaign_settings.app_id
-                    
-                    stat = {
-                        'youtube_id': row.asset.youtube_video_asset.youtube_video_id,
-                        'package_id': pkg_id if pkg_id else 'N/A',
-                        'campaign_id': str(row.campaign.id),
-                        'campaign_name': row.campaign.name,
-                        'impressions': row.metrics.impressions,
-                        'clicks': row.metrics.clicks,
-                        'cost': row.metrics.cost_micros / 1000000.0,
-                        'conversions': row.metrics.conversions,
-                        'video_views': row.metrics.video_views,
-                        'account_id': str(row.customer.id),
-                        'account_name': row.customer.descriptive_name
-                    }
-                    
-                    # Add ad group info if available (only in the first query)
-                    if hasattr(row, 'ad_group'):
-                        stat['ad_group_id'] = str(row.ad_group.id)
-                        stat['ad_group_name'] = row.ad_group.name
-                    else:
-                        stat['ad_group_id'] = 'N/A'
-                        stat['ad_group_name'] = 'N/A'
-                        
-                    stats.append(stat)
+                youtube_asset = asset.get("youtubeVideoAsset", {})
+                app_settings = campaign.get("appCampaignSetting", {})
+                
+                youtube_id = youtube_asset.get("youtubeVideoId")
+                if not youtube_id:
+                    continue
+                
+                stats.append({
+                    'youtube_id': youtube_id,
+                    'package_id': app_settings.get("appId", "N/A"),
+                    'campaign_id': str(campaign.get("id", "")),
+                    'campaign_name': campaign.get("name", ""),
+                    'impressions': int(metrics.get("impressions", 0)),
+                    'clicks': int(metrics.get("clicks", 0)),
+                    'cost': float(metrics.get("costMicros", 0)) / 1000000.0,
+                    'conversions': float(metrics.get("conversions", 0)),
+                    'video_views': int(metrics.get("videoViews", 0)),
+                    'account_id': str(customer.get("id", "")),
+                    'account_name': customer.get("descriptiveName", ""),
+                    'ad_group_id': 'N/A',
+                    'ad_group_name': 'N/A'
+                })
             except Exception as e:
-                logger.debug(f"Query failed for customer {customer_id}: {e}")
-
+                logger.debug(f"Error parsing row: {e}")
+                continue
+        
+        logger.info(f"  Found {len(stats)} video stats for customer {customer_id}")
         return stats
 
     def init_bigquery(self):
-        """Ensure Dataset exists"""
-        dataset_ref = self.bq_client.dataset(self.dataset_id)
+        """Ensure dataset exists"""
+        dataset_ref = bigquery.DatasetReference(self.bq_client.project, self.dataset_id)
         try:
             self.bq_client.get_dataset(dataset_ref)
-        except Exception:
-            logger.info(f"Creating dataset '{self.dataset_id}'...")
+        except:
             dataset = bigquery.Dataset(dataset_ref)
             dataset.location = "US"
             self.bq_client.create_dataset(dataset)
+            logger.info(f"Created dataset {self.dataset_id}")
 
-    def run_sync(self):
+    def run(self):
         logger.info("Starting Google Ads Video Sync...")
+        
+        # Initialize BigQuery
         self.init_bigquery()
         
-        # 1. Fetch existing videos from BigQuery to get the hex -> youtube_id mapping
-        try:
-            query = f"SELECT video_id, youtube_url FROM `{self.full_table_id}`"
-            df_bq = self.bq_client.query(query).to_dataframe()
-            logger.info(f"Loaded {len(df_bq)} videos from BigQuery.")
-        except Exception as e:
-            logger.error(f"Could not read from BigQuery: {e}")
-            return
-
-        # Build mapping: youtube_id -> video_id (hex)
+        # 1. Load video map from BigQuery
+        query = f"SELECT video_id, youtube_url FROM `{self.full_table_id}`"
+        df_videos = self.bq_client.query(query).to_dataframe()
+        logger.info(f"Loaded {len(df_videos)} videos from BigQuery.")
+        
+        # Create mapping: hex_id -> youtube_id
+        hex_to_yt = {}
         yt_to_hex = {}
-        for _, row in df_bq.iterrows():
+        for _, row in df_videos.iterrows():
             hex_id = row['video_id']
             yt_id = self.hex_to_youtube_id(hex_id)
             if yt_id:
+                hex_to_yt[hex_id] = yt_id
                 yt_to_hex[yt_id] = hex_id
-
-        # 2. Iterate through accounts and fetch stats
-        all_stats = []
-        customer_ids = self.get_accessible_customers()
         
+        logger.info(f"Mapped {len(yt_to_hex)} videos for matching.")
+        
+        # 2. Get customer IDs from environment
+        customer_ids_env = os.getenv('GOOGLE_ADS_CUSTOMER_IDS', '')
+        if not customer_ids_env:
+            logger.error("GOOGLE_ADS_CUSTOMER_IDS environment variable is required")
+            return
+        
+        customer_ids = [cid.strip().replace("-", "") for cid in customer_ids_env.split(',') if cid.strip()]
+        logger.info(f"Processing {len(customer_ids)} customer accounts...")
+        
+        # 3. Fetch video stats from all accounts
+        all_stats = []
         for cid in customer_ids:
             logger.info(f"Processing Customer: {cid}")
-            account_stats = self.get_video_stats(cid)
-            all_stats.extend(account_stats)
-
+            stats = self.get_video_stats(cid)
+            all_stats.extend(stats)
+        
         if not all_stats:
             logger.info("No video stats found in Google Ads.")
             return
-
-        # 3. Aggregate stats by (youtube_id, package_id)
+        
+        logger.info(f"Total raw stats collected: {len(all_stats)}")
+        
+        # 4. Aggregate stats by (youtube_id, package_id)
         df_ads = pd.DataFrame(all_stats)
         
-        # Deduplicate: if a row has same (account, campaign, ad_group, youtube_id, package_id), it's a duplicate
-        # We also want to avoid double counting if a video is reported at both Campaign and Ad Group level.
-        # Strategy: Prioritize Ad Group level stats if available, otherwise Campaign level.
-        # However, for simplicity and accuracy, we'll just drop exact duplicates first.
-        df_ads = df_ads.drop_duplicates(subset=['account_id', 'campaign_id', 'ad_group_id', 'youtube_id', 'package_id'])
+        # Deduplicate
+        df_ads = df_ads.drop_duplicates(subset=['account_id', 'campaign_id', 'youtube_id', 'package_id'])
         
         # Filter: only keep stats for videos we have in our database
         df_ads['video_id'] = df_ads['youtube_id'].map(yt_to_hex)
@@ -284,7 +274,9 @@ class GoogleAdsVideoSync:
         if df_ads.empty:
             logger.info("None of the videos in Google Ads match the BigQuery database.")
             return
-
+        
+        logger.info(f"Matched {len(df_ads)} video stats with BigQuery data.")
+        
         # Group and sum metrics
         agg_functions = {
             'impressions': 'sum',
@@ -296,7 +288,7 @@ class GoogleAdsVideoSync:
         }
         df_agg = df_ads.groupby(['video_id', 'package_id']).agg(agg_functions).reset_index()
 
-        # 4. Upload the full aggregated dataset back to BigQuery
+        # 5. Upload to BigQuery
         stats_table_id = f"{self.bq_client.project}.{self.dataset_id}.video_performance_stats"
         
         job_config = bigquery.LoadJobConfig(
@@ -307,7 +299,7 @@ class GoogleAdsVideoSync:
         job = self.bq_client.load_table_from_dataframe(df_agg, stats_table_id, job_config=job_config)
         job.result()
         
-        # 5. Create Comparison View
+        # 6. Create Comparison View
         self.create_comparison_view()
         
         logger.info("✓ Google Ads Sync Complete!")
@@ -335,20 +327,22 @@ class GoogleAdsVideoSync:
             LEFT JOIN `{self.bq_client.project}.{self.dataset_id}.video_performance_stats` s 
               ON t.video_id = s.video_id
         """
+        
         view = bigquery.Table(view_id)
         view.view_query = view_query
+        
         try:
             self.bq_client.delete_table(view_id, not_found_ok=True)
             self.bq_client.create_table(view)
-            logger.info(f"✓ Comparison view created: {view_id}")
+            logger.info(f"Created comparison view: {view_id}")
         except Exception as e:
-            logger.warning(f"Could not create comparison view: {e}")
+            logger.warning(f"Could not create view: {e}")
+
 
 if __name__ == "__main__":
     try:
         sync = GoogleAdsVideoSync()
-        sync.run_sync()
+        sync.run()
     except Exception as e:
-        logger.error(f"FATAL ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Sync failed: {e}")
+        raise
