@@ -1,6 +1,7 @@
 """
-Google Ads Video Performance Sync (REST API Version)
-Uses direct REST API calls instead of the google-ads Python library to avoid gRPC issues.
+Google Ads Video Performance Sync
+Fetches video performance stats from Google Ads and syncs to BigQuery.
+Uses google-ads library with proper gRPC configuration.
 """
 
 import os
@@ -9,10 +10,10 @@ import logging
 import base64
 from datetime import datetime
 from pathlib import Path
-import requests
 import pandas as pd
 from google.cloud import bigquery
-from google.oauth2.credentials import Credentials
+from google.ads.googleads.client import GoogleAdsClient
+from google.ads.googleads.errors import GoogleAdsException
 
 # Setup logging
 Path("logs").mkdir(exist_ok=True)
@@ -41,69 +42,29 @@ class GoogleAdsVideoSync:
         self.table_id = os.getenv('BIGQUERY_TABLE', 'clean_ads_transparency')
         self.full_table_id = f"{self.bq_client.project}.{self.dataset_id}.{self.table_id}"
 
-        # Google Ads REST API Config
-        self.developer_token = os.getenv('GOOGLE_ADS_DEVELOPER_TOKEN')
-        self.client_id = os.getenv('GOOGLE_ADS_CLIENT_ID')
-        self.client_secret = os.getenv('GOOGLE_ADS_CLIENT_SECRET')
-        self.refresh_token = os.getenv('GOOGLE_ADS_REFRESH_TOKEN')
-        
-        if not all([self.developer_token, self.client_id, self.client_secret, self.refresh_token]):
-            raise ValueError("Missing Google Ads credentials")
-        
-        # Get access token
-        self.access_token = self._get_access_token()
-        
-        # API base URL - use v17 which is stable
-        self.api_version = "v17"
-        self.base_url = f"https://googleads.googleapis.com/{self.api_version}"
-
-    def _get_access_token(self):
-        """Get access token using refresh token"""
-        token_url = "https://oauth2.googleapis.com/token"
-        data = {
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "refresh_token": self.refresh_token,
-            "grant_type": "refresh_token"
-        }
-        response = requests.post(token_url, data=data)
-        if response.status_code != 200:
-            logger.error(f"Failed to get access token: {response.text}")
-            raise Exception("Failed to authenticate with Google")
-        
-        token = response.json()["access_token"]
-        logger.info(f"Access token obtained successfully (length: {len(token)})")
-        logger.info(f"Developer token: {self.developer_token[:10]}..." if self.developer_token else "Developer token: MISSING!")
-        return token
-
-
-    def _make_request(self, endpoint, method="GET", data=None, customer_id=None):
-        """Make REST API request to Google Ads"""
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "developer-token": self.developer_token,
-            "Content-Type": "application/json"
+        # Google Ads Config
+        self.ads_config = {
+            "client_id": os.getenv('GOOGLE_ADS_CLIENT_ID'),
+            "client_secret": os.getenv('GOOGLE_ADS_CLIENT_SECRET'),
+            "refresh_token": os.getenv('GOOGLE_ADS_REFRESH_TOKEN'),
+            "developer_token": os.getenv('GOOGLE_ADS_DEVELOPER_TOKEN'),
+            "use_proto_plus": True
         }
         
-        if customer_id:
-            headers["login-customer-id"] = customer_id
+        login_customer_id = os.getenv('GOOGLE_ADS_LOGIN_CUSTOMER_ID')
+        if login_customer_id:
+            self.ads_config["login_customer_id"] = login_customer_id.replace("-", "")
         
-        url = f"{self.base_url}/{endpoint}"
+        logger.info(f"Initializing Google Ads client...")
+        logger.info(f"  Developer token: {self.ads_config['developer_token'][:10]}...")
+        logger.info(f"  Client ID: {self.ads_config['client_id'][:20]}...")
         
         try:
-            if method == "GET":
-                response = requests.get(url, headers=headers)
-            else:
-                response = requests.post(url, headers=headers, json=data)
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.debug(f"API Error ({response.status_code}): {response.text[:500]}")
-                return None
+            self.ads_client = GoogleAdsClient.load_from_dict(self.ads_config)
+            logger.info("  Google Ads client initialized successfully!")
         except Exception as e:
-            logger.debug(f"Request failed: {e}")
-            return None
+            logger.error(f"  Failed to initialize Google Ads client: {e}")
+            raise
 
     def hex_to_youtube_id(self, hex_id):
         """Standard conversion used in clean_data.py"""
@@ -116,89 +77,12 @@ class GoogleAdsVideoSync:
         except:
             return None
 
-    def test_api_connectivity(self):
-        """Test basic API connectivity with simplest possible call"""
-        logger.info("Testing API connectivity...")
-        
-        # Test 1: Try listing accessible customers (simplest call)
-        test_url = f"https://googleads.googleapis.com/{self.api_version}/customers:listAccessibleCustomers"
-        
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "developer-token": self.developer_token,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        
-        logger.info(f"  Test URL: {test_url}")
-        
-        try:
-            response = requests.get(test_url, headers=headers)
-            logger.info(f"  Response Status: {response.status_code}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                logger.info(f"  SUCCESS! Accessible customers: {json.dumps(result, indent=2)}")
-                return result.get("resourceNames", [])
-            else:
-                try:
-                    error_json = response.json()
-                    logger.error(f"  API Error (JSON): {json.dumps(error_json, indent=2)}")
-                except:
-                    logger.error(f"  API Error (Text): {response.text[:1000]}")
-                return []
-        except Exception as e:
-            logger.error(f"  Exception: {e}")
-            return []
-
-    def search_google_ads(self, customer_id, query):
-        """Execute a GAQL query using REST API"""
-        # Use the regular search endpoint (not stream)
-        url = f"https://googleads.googleapis.com/{self.api_version}/customers/{customer_id}/googleAds:search"
-        
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "developer-token": self.developer_token,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        
-        # For the regular search endpoint, we need pageSize
-        data = {
-            "query": query,
-            "pageSize": 10000
-        }
-        
-        logger.info(f"    Calling: {url}")
-        
-        try:
-            response = requests.post(url, headers=headers, json=data)
-            
-            logger.info(f"    API Response Status: {response.status_code}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                all_results = result.get("results", [])
-                logger.info(f"    Rows returned: {len(all_results)}")
-                return all_results
-            else:
-                # Log the actual error message
-                try:
-                    error_json = response.json()
-                    error_msg = json.dumps(error_json, indent=2)[:1500]
-                except:
-                    error_msg = response.text[:1500] if response.text else "No error message"
-                logger.warning(f"    API Error: {error_msg}")
-                return []
-        except Exception as e:
-            logger.error(f"    Request exception: {e}")
-            return []
-
     def get_video_stats(self, customer_id):
-        """Query Google Ads for video stats using REST API"""
+        """Query Google Ads for video stats"""
+        ga_service = self.ads_client.get_service("GoogleAdsService")
         stats = []
         
-        # Query for campaign-level assets
+        # Simple query for campaign assets with YouTube videos
         query = """
             SELECT
               asset.youtube_video_asset.youtube_video_id,
@@ -208,8 +92,6 @@ class GoogleAdsVideoSync:
               metrics.impressions,
               metrics.clicks,
               metrics.cost_micros,
-              metrics.conversions,
-              metrics.video_views,
               customer.id,
               customer.descriptive_name
             FROM campaign_asset
@@ -217,42 +99,41 @@ class GoogleAdsVideoSync:
               AND metrics.impressions > 0
         """
         
-        results = self.search_google_ads(customer_id, query)
-        
-        for row in results:
-            try:
-                asset = row.get("asset", {})
-                campaign = row.get("campaign", {})
-                metrics = row.get("metrics", {})
-                customer = row.get("customer", {})
-                
-                youtube_asset = asset.get("youtubeVideoAsset", {})
-                app_settings = campaign.get("appCampaignSetting", {})
-                
-                youtube_id = youtube_asset.get("youtubeVideoId")
+        try:
+            logger.info(f"    Querying campaign_asset for customer {customer_id}...")
+            response = ga_service.search(customer_id=customer_id, query=query)
+            
+            for row in response:
+                youtube_id = row.asset.youtube_video_asset.youtube_video_id
                 if not youtube_id:
                     continue
-                
+                    
                 stats.append({
                     'youtube_id': youtube_id,
-                    'package_id': app_settings.get("appId", "N/A"),
-                    'campaign_id': str(campaign.get("id", "")),
-                    'campaign_name': campaign.get("name", ""),
-                    'impressions': int(metrics.get("impressions", 0)),
-                    'clicks': int(metrics.get("clicks", 0)),
-                    'cost': float(metrics.get("costMicros", 0)) / 1000000.0,
-                    'conversions': float(metrics.get("conversions", 0)),
-                    'video_views': int(metrics.get("videoViews", 0)),
-                    'account_id': str(customer.get("id", "")),
-                    'account_name': customer.get("descriptiveName", ""),
+                    'package_id': row.campaign.app_campaign_setting.app_id or 'N/A',
+                    'campaign_id': str(row.campaign.id),
+                    'campaign_name': row.campaign.name,
+                    'impressions': row.metrics.impressions,
+                    'clicks': row.metrics.clicks,
+                    'cost': row.metrics.cost_micros / 1000000.0,
+                    'account_id': str(row.customer.id),
+                    'account_name': row.customer.descriptive_name,
                     'ad_group_id': 'N/A',
                     'ad_group_name': 'N/A'
                 })
-            except Exception as e:
-                logger.debug(f"Error parsing row: {e}")
-                continue
+            
+            logger.info(f"    Found {len(stats)} video stats")
+            
+        except GoogleAdsException as ex:
+            logger.error(f"    Google Ads API error for {customer_id}:")
+            for error in ex.failure.errors:
+                logger.error(f"      Error: {error.message}")
+                if error.location:
+                    for field_error in error.location.field_path_elements:
+                        logger.error(f"        Field: {field_error.field_name}")
+        except Exception as e:
+            logger.error(f"    Error querying customer {customer_id}: {e}")
         
-        logger.info(f"  Found {len(stats)} video stats for customer {customer_id}")
         return stats
 
     def init_bigquery(self):
@@ -272,15 +153,7 @@ class GoogleAdsVideoSync:
         # Initialize BigQuery
         self.init_bigquery()
         
-        # Test API connectivity first
-        accessible = self.test_api_connectivity()
-        if not accessible:
-            logger.error("API connectivity test failed. Please check:")
-            logger.error("  1. Google Ads API is enabled in Google Cloud Console")
-            logger.error("  2. Developer token is valid and approved")
-            logger.error("  3. OAuth credentials have correct access")
-            # Continue anyway to see more detailed errors
-
+        # 1. Load video map from BigQuery
         query = f"SELECT video_id, youtube_url FROM `{self.full_table_id}`"
         df_videos = self.bq_client.query(query).to_dataframe()
         logger.info(f"Loaded {len(df_videos)} videos from BigQuery.")
@@ -340,8 +213,6 @@ class GoogleAdsVideoSync:
             'impressions': 'sum',
             'clicks': 'sum',
             'cost': 'sum',
-            'conversions': 'sum',
-            'video_views': 'sum',
             'account_name': lambda x: ', '.join(sorted(set(str(v) for v in x if v)))
         }
         df_agg = df_ads.groupby(['video_id', 'package_id']).agg(agg_functions).reset_index()
@@ -376,8 +247,6 @@ class GoogleAdsVideoSync:
               s.impressions as google_ads_impressions,
               s.clicks as google_ads_clicks,
               s.cost as google_ads_cost,
-              s.conversions as google_ads_conversions,
-              s.video_views as google_ads_youtube_views,
               s.account_name as google_ads_accounts,
               t.last_updated as last_sync_organic,
               CURRENT_TIMESTAMP() as last_sync_ads
