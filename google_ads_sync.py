@@ -39,7 +39,8 @@ class GoogleAdsVideoSync:
                 "client_secret": os.getenv('GOOGLE_ADS_CLIENT_SECRET'),
                 "refresh_token": os.getenv('GOOGLE_ADS_REFRESH_TOKEN'),
                 "developer_token": os.getenv('GOOGLE_ADS_DEVELOPER_TOKEN'),
-                "use_proto_plus": False
+                "use_proto_plus": False,
+                "transport": "rest"
             }
             if os.getenv('GOOGLE_ADS_LOGIN_CUSTOMER_ID'):
                 self.ads_config["login_customer_id"] = os.getenv('GOOGLE_ADS_LOGIN_CUSTOMER_ID')
@@ -58,8 +59,8 @@ class GoogleAdsVideoSync:
 
     def get_client_accounts(self, customer_id):
         """Recursively find all client accounts under a manager account"""
-        # Force v17 for better compatibility
-        ga_service = self.ads_client.get_service("GoogleAdsService", version="v17")
+        # Force v18 for better compatibility
+        ga_service = self.ads_client.get_service("GoogleAdsService", version="v18")
         query = """
             SELECT
               customer_client.client_customer,
@@ -74,7 +75,7 @@ class GoogleAdsVideoSync:
         
         client_ids = []
         try:
-            search_request = self.ads_client.get_type("SearchGoogleAdsRequest", version="v17")
+            search_request = self.ads_client.get_type("SearchGoogleAdsRequest", version="v18")
             search_request.customer_id = str(customer_id).replace("-", "")
             search_request.query = query
             response = ga_service.search(request=search_request)
@@ -105,7 +106,7 @@ class GoogleAdsVideoSync:
 
         # Priority 2: Try Listing all accessible customers
         try:
-            customer_service = self.ads_client.get_service("CustomerService", version="v17")
+            customer_service = self.ads_client.get_service("CustomerService", version="v18")
             customer_resource_names = customer_service.list_accessible_customers()
             
             for resource_name in customer_resource_names.resource_names:
@@ -127,7 +128,7 @@ class GoogleAdsVideoSync:
 
     def get_video_stats(self, customer_id):
         """Query Google Ads for video stats including package ID (app_id)"""
-        ga_service = self.ads_client.get_service("GoogleAdsService", version="v17")
+        ga_service = self.ads_client.get_service("GoogleAdsService", version="v18")
         stats = []
         
         # Query: Assets linked to campaigns or ad groups
@@ -172,7 +173,7 @@ class GoogleAdsVideoSync:
         
         for q in [query, query_campaign]:
             try:
-                search_request = self.ads_client.get_type("SearchGoogleAdsRequest", version="v17")
+                search_request = self.ads_client.get_type("SearchGoogleAdsRequest", version="v18")
                 search_request.customer_id = str(customer_id).replace("-", "")
                 search_request.query = q
                 
