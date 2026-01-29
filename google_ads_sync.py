@@ -127,6 +127,44 @@ class GoogleAdsVideoSync:
         # Empty result set is OK
         return {'result': True, 'response': []}
 
+    def get_asset_youtube_id_map(self, customer_id):
+        """
+        Get a mapping of asset resource names to YouTube video IDs.
+        This resolves 'customers/xxx/assets/yyy' to actual YouTube video IDs like 'EZ4NueUog5E'.
+        """
+        query = """
+            SELECT
+              asset.resource_name,
+              asset.youtube_video_asset.youtube_video_id,
+              asset.youtube_video_asset.youtube_video_title
+            FROM asset
+            WHERE asset.type = 'YOUTUBE_VIDEO'
+        """
+        
+        logger.info(f"    Fetching asset -> YouTube ID mapping...")
+        result = self.search(query, customer_id)
+        
+        asset_map = {}
+        if result['result'] and result['response']:
+            for row in result['response']:
+                asset = row.get('asset', {})
+                resource_name = asset.get('resourceName', '')
+                yt_asset = asset.get('youtubeVideoAsset', {})
+                youtube_id = yt_asset.get('youtubeVideoId', '')
+                youtube_title = yt_asset.get('youtubeVideoTitle', '')
+                
+                if resource_name and youtube_id:
+                    asset_map[resource_name] = {
+                        'youtube_id': youtube_id,
+                        'title': youtube_title
+                    }
+            
+            logger.info(f"      Mapped {len(asset_map)} assets to YouTube IDs")
+        else:
+            logger.info(f"      No assets found for mapping")
+        
+        return asset_map
+
     def hex_to_youtube_id(self, hex_id):
         """Standard conversion used in clean_data.py"""
         if not hex_id or len(hex_id) < 10:
@@ -142,6 +180,10 @@ class GoogleAdsVideoSync:
         """Query Google Ads for video stats from multiple sources"""
         stats = []
         seen_keys = set()
+        
+        # First, get the asset -> YouTube ID mapping
+        asset_map = self.get_asset_youtube_id_map(customer_id)
+
         
         # Query 1: Campaign-level assets
         query1 = """
@@ -244,7 +286,7 @@ class GoogleAdsVideoSync:
         if result4['result'] and result4['response']:
             logger.info(f"      Raw APP_AD rows: {len(result4['response'])}")
             for row in result4['response']:
-                self._process_app_ad_row(row, stats, seen_keys, 'app_ad')
+                self._process_app_ad_row(row, stats, seen_keys, 'app_ad', asset_map)
         else:
             logger.info(f"      No APP_AD data found")
         
@@ -273,14 +315,14 @@ class GoogleAdsVideoSync:
         if result5['result'] and result5['response']:
             logger.info(f"      Raw APP_ENGAGEMENT_AD rows: {len(result5['response'])}")
             for row in result5['response']:
-                self._process_app_ad_row(row, stats, seen_keys, 'app_engagement_ad')
+                self._process_app_ad_row(row, stats, seen_keys, 'app_engagement_ad', asset_map)
         else:
             logger.info(f"      No APP_ENGAGEMENT_AD data found")
         
         logger.info(f"    Total video stats for this customer: {len(stats)}")
         return stats
 
-    def _process_app_ad_row(self, row, stats, seen_keys, source):
+    def _process_app_ad_row(self, row, stats, seen_keys, source, asset_map):
         """Process app_ad or app_engagement_ad row to extract videos"""
         try:
             ad_group_ad = row.get('adGroupAd', {})
@@ -302,18 +344,25 @@ class GoogleAdsVideoSync:
             if not videos:
                 return
             
-            logger.info(f"        Found {len(videos)} videos in ad {ad.get('id', 'N/A')}")
-            
             for video in videos:
                 # Video is a reference to an asset
                 asset_resource = video.get('asset', '')
                 
-                # Create dedup key
+                # Resolve asset resource to actual YouTube video ID
+                youtube_id = None
+                if asset_resource in asset_map:
+                    youtube_id = asset_map[asset_resource]['youtube_id']
+                
+                if not youtube_id:
+                    # Skip if we can't resolve the YouTube ID
+                    continue
+                
+                # Create dedup key using actual YouTube ID
                 key = (
                     str(customer.get('id', '')),
                     str(campaign.get('id', '')),
                     str(ad_group.get('id', '')),
-                    asset_resource
+                    youtube_id
                 )
                 
                 if key in seen_keys:
@@ -321,7 +370,7 @@ class GoogleAdsVideoSync:
                 seen_keys.add(key)
                 
                 stats.append({
-                    'youtube_id': asset_resource,  # This is the asset resource name, we'll need to resolve it
+                    'youtube_id': youtube_id,  # Now this is the actual YouTube video ID!
                     'package_id': campaign.get('appCampaignSetting', {}).get('appId', 'N/A'),
                     'campaign_id': str(campaign.get('id', '')),
                     'campaign_name': campaign.get('name', ''),
@@ -336,7 +385,7 @@ class GoogleAdsVideoSync:
                     'asset_resource': asset_resource
                 })
                 
-                logger.info(f"          Video asset: {asset_resource}")
+                logger.info(f"          YouTube ID: {youtube_id}")
                 
         except Exception as e:
             logger.warning(f"Error parsing app ad row: {e}")
