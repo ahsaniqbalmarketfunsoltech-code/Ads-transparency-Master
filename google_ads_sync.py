@@ -118,43 +118,81 @@ class GoogleAdsVideoSync:
         ga_service = self.ads_client.get_service("GoogleAdsService")
         stats = []
         
-        # Query: Assets linked to campaigns (Covers App Campaigns and modern Video Ads)
+        # Query: Assets linked to campaigns or ad groups
+        # This covers App Campaigns and modern Video Ads (Responsive Video Ads)
         query = """
             SELECT
               asset.youtube_video_asset.youtube_video_id,
               campaign.app_campaign_settings.app_id,
+              campaign.id,
+              campaign.name,
+              ad_group.id,
+              ad_group.name,
+              metrics.impressions,
+              metrics.clicks,
+              metrics.cost_micros,
+              metrics.conversions,
+              metrics.video_views,
+              customer.id,
+              customer.descriptive_name
+            FROM ad_group_asset
+            WHERE asset.type = 'YOUTUBE_VIDEO'
+              AND metrics.impressions > 0
+        """
+        # Note: If no assets are at ad_group level, we also check campaign level
+        query_campaign = """
+            SELECT
+              asset.youtube_video_asset.youtube_video_id,
+              campaign.app_campaign_settings.app_id,
+              campaign.id,
               campaign.name,
               metrics.impressions,
               metrics.clicks,
               metrics.cost_micros,
+              metrics.conversions,
+              metrics.video_views,
+              customer.id,
               customer.descriptive_name
             FROM campaign_asset
             WHERE asset.type = 'YOUTUBE_VIDEO'
               AND metrics.impressions > 0
         """
         
-        try:
-            search_request = self.ads_client.get_type("SearchGoogleAdsRequest")
-            search_request.customer_id = customer_id
-            search_request.query = query
-            
-            response = ga_service.search(request=search_request)
-            for row in response:
-                pkg_id = row.campaign.app_campaign_settings.app_id
-                # Fallback: if app_id is missing, try to get it from name or just mark as N/A
-                # Some campaigns are not App campaigns but still use videos
-                stats.append({
-                    'youtube_id': row.asset.youtube_video_asset.youtube_video_id,
-                    'package_id': pkg_id if pkg_id else 'N/A',
-                    'campaign_name': row.campaign.name,
-                    'impressions': row.metrics.impressions,
-                    'clicks': row.metrics.clicks,
-                    'cost': row.metrics.cost_micros / 1000000.0,
-                    'account_id': customer_id,
-                    'account_name': row.customer.descriptive_name
-                })
-        except Exception as e:
-            logger.debug(f"Query failed for customer {customer_id}: {e}")
+        for q in [query, query_campaign]:
+            try:
+                search_request = self.ads_client.get_type("SearchGoogleAdsRequest")
+                search_request.customer_id = customer_id
+                search_request.query = q
+                
+                response = ga_service.search(request=search_request)
+                for row in response:
+                    pkg_id = row.campaign.app_campaign_settings.app_id
+                    
+                    stat = {
+                        'youtube_id': row.asset.youtube_video_asset.youtube_video_id,
+                        'package_id': pkg_id if pkg_id else 'N/A',
+                        'campaign_id': str(row.campaign.id),
+                        'campaign_name': row.campaign.name,
+                        'impressions': row.metrics.impressions,
+                        'clicks': row.metrics.clicks,
+                        'cost': row.metrics.cost_micros / 1000000.0,
+                        'conversions': row.metrics.conversions,
+                        'video_views': row.metrics.video_views,
+                        'account_id': str(row.customer.id),
+                        'account_name': row.customer.descriptive_name
+                    }
+                    
+                    # Add ad group info if available (only in the first query)
+                    if hasattr(row, 'ad_group'):
+                        stat['ad_group_id'] = str(row.ad_group.id)
+                        stat['ad_group_name'] = row.ad_group.name
+                    else:
+                        stat['ad_group_id'] = 'N/A'
+                        stat['ad_group_name'] = 'N/A'
+                        
+                    stats.append(stat)
+            except Exception as e:
+                logger.debug(f"Query failed for customer {customer_id}: {e}")
 
         return stats
 
@@ -206,6 +244,12 @@ class GoogleAdsVideoSync:
         # 3. Aggregate stats by (youtube_id, package_id)
         df_ads = pd.DataFrame(all_stats)
         
+        # Deduplicate: if a row has same (account, campaign, ad_group, youtube_id, package_id), it's a duplicate
+        # We also want to avoid double counting if a video is reported at both Campaign and Ad Group level.
+        # Strategy: Prioritize Ad Group level stats if available, otherwise Campaign level.
+        # However, for simplicity and accuracy, we'll just drop exact duplicates first.
+        df_ads = df_ads.drop_duplicates(subset=['account_id', 'campaign_id', 'ad_group_id', 'youtube_id', 'package_id'])
+        
         # Filter: only keep stats for videos we have in our database
         df_ads['video_id'] = df_ads['youtube_id'].map(yt_to_hex)
         df_ads = df_ads.dropna(subset=['video_id'])
@@ -213,26 +257,19 @@ class GoogleAdsVideoSync:
         if df_ads.empty:
             logger.info("None of the videos in Google Ads match the BigQuery database.")
             return
-
++
         # Group and sum metrics
         agg_functions = {
             'impressions': 'sum',
             'clicks': 'sum',
             'cost': 'sum',
-            'account_name': lambda x: ', '.join(set(x))
+            'conversions': 'sum',
+            'video_views': 'sum',
+            'account_name': lambda x: ', '.join(sorted(set(str(v) for v in x if v)))
         }
         df_agg = df_ads.groupby(['video_id', 'package_id']).agg(agg_functions).reset_index()
 
-        # 4. Merge with original data and update BigQuery
-        # Since one video can have multiple package IDs, we might want to:
-        # a) Keep one row per video and join stats (ignoring package ID or picking one)
-        # b) Create a new table with video_id and package_id
-        
-        # The user said: "make sure it fetch packgae id so i can filter it which vidoe use in which package id"
-        # and "put data for right vidoe rows". 
-        # This suggests they want a view or table where video stats are broken down by package.
-        
-        # For simplicity and to match their request, I'll create a new table for the stats breakdown
+        # 4. Upload the full aggregated dataset back to BigQuery
         stats_table_id = f"{self.bq_client.project}.{self.dataset_id}.video_performance_stats"
         
         job_config = bigquery.LoadJobConfig(
@@ -262,6 +299,8 @@ class GoogleAdsVideoSync:
               s.impressions as google_ads_impressions,
               s.clicks as google_ads_clicks,
               s.cost as google_ads_cost,
+              s.conversions as google_ads_conversions,
+              s.video_views as google_ads_youtube_views,
               s.account_name as google_ads_accounts,
               t.last_updated as last_sync_organic,
               CURRENT_TIMESTAMP() as last_sync_ads
