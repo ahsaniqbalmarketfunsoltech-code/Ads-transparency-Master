@@ -53,8 +53,8 @@ class GoogleAdsVideoSync:
         # Get access token
         self.access_token = self._get_access_token()
         
-        # API base URL
-        self.api_version = "v18"
+        # API base URL - use v17 which is stable
+        self.api_version = "v17"
         self.base_url = f"https://googleads.googleapis.com/{self.api_version}"
 
     def _get_access_token(self):
