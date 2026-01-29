@@ -1,7 +1,6 @@
 """
-Google Ads Video Performance Sync
-Fetches video performance stats from Google Ads and updates clean_ads_transparency table.
-Uses batch MERGE for fast updates.
+Google Ads Video Performance Sync - FULL DETAILS VERSION
+Fetches ALL available video stats from Google Ads and updates clean_ads_transparency table.
 """
 
 import os
@@ -104,7 +103,9 @@ class GoogleAdsVideoSync:
             SELECT
               asset.resource_name,
               asset.youtube_video_asset.youtube_video_id,
-              asset.policy_summary.approval_status
+              asset.youtube_video_asset.youtube_video_title,
+              asset.policy_summary.approval_status,
+              asset.policy_summary.review_status
             FROM asset
             WHERE asset.type = 'YOUTUBE_VIDEO'
         """
@@ -115,36 +116,64 @@ class GoogleAdsVideoSync:
             for row in result['response']:
                 asset = row.get('asset', {})
                 resource_name = asset.get('resourceName', '')
-                youtube_id = asset.get('youtubeVideoAsset', {}).get('youtubeVideoId', '')
-                approval_status = asset.get('policySummary', {}).get('approvalStatus', 'UNKNOWN')
+                yt_asset = asset.get('youtubeVideoAsset', {})
+                youtube_id = yt_asset.get('youtubeVideoId', '')
+                youtube_title = yt_asset.get('youtubeVideoTitle', '')
+                policy = asset.get('policySummary', {})
+                approval_status = policy.get('approvalStatus', 'UNKNOWN')
+                review_status = policy.get('reviewStatus', 'UNKNOWN')
                 
                 if resource_name and youtube_id:
                     asset_map[resource_name] = {
                         'youtube_id': youtube_id,
-                        'approval_status': approval_status
+                        'youtube_title': youtube_title,
+                        'approval_status': approval_status,
+                        'review_status': review_status
                     }
         return asset_map
 
     def get_video_stats(self, customer_id):
-        """Query Google Ads for video stats with status"""
+        """Query Google Ads for ALL video stats and details"""
         stats = []
         seen_keys = set()
         
         asset_map = self.get_asset_info_map(customer_id)
         
-        # Query APP_AD
+        # Query APP_AD with ALL available metrics
         query = """
             SELECT
               ad_group_ad.ad.app_ad.youtube_videos,
+              ad_group_ad.ad.id,
               ad_group_ad.status,
+              ad_group.id,
+              ad_group.name,
               ad_group.status,
+              campaign.id,
+              campaign.name,
               campaign.status,
               campaign.app_campaign_setting.app_id,
+              campaign.app_campaign_setting.app_store,
+              campaign.advertising_channel_type,
+              campaign.advertising_channel_sub_type,
+              campaign.start_date,
+              campaign.end_date,
               customer.id,
               customer.descriptive_name,
               metrics.impressions,
               metrics.clicks,
-              metrics.cost_micros
+              metrics.cost_micros,
+              metrics.conversions,
+              metrics.conversions_value,
+              metrics.video_views,
+              metrics.video_quartile_p25_rate,
+              metrics.video_quartile_p50_rate,
+              metrics.video_quartile_p75_rate,
+              metrics.video_quartile_p100_rate,
+              metrics.average_cpc,
+              metrics.average_cpm,
+              metrics.ctr,
+              metrics.all_conversions,
+              metrics.interactions
             FROM ad_group_ad
             WHERE ad_group_ad.ad.type = 'APP_AD'
         """
@@ -158,15 +187,37 @@ class GoogleAdsVideoSync:
         query2 = """
             SELECT
               ad_group_ad.ad.app_engagement_ad.videos,
+              ad_group_ad.ad.id,
               ad_group_ad.status,
+              ad_group.id,
+              ad_group.name,
               ad_group.status,
+              campaign.id,
+              campaign.name,
               campaign.status,
               campaign.app_campaign_setting.app_id,
+              campaign.app_campaign_setting.app_store,
+              campaign.advertising_channel_type,
+              campaign.advertising_channel_sub_type,
+              campaign.start_date,
+              campaign.end_date,
               customer.id,
               customer.descriptive_name,
               metrics.impressions,
               metrics.clicks,
-              metrics.cost_micros
+              metrics.cost_micros,
+              metrics.conversions,
+              metrics.conversions_value,
+              metrics.video_views,
+              metrics.video_quartile_p25_rate,
+              metrics.video_quartile_p50_rate,
+              metrics.video_quartile_p75_rate,
+              metrics.video_quartile_p100_rate,
+              metrics.average_cpc,
+              metrics.average_cpm,
+              metrics.ctr,
+              metrics.all_conversions,
+              metrics.interactions
             FROM ad_group_ad
             WHERE ad_group_ad.ad.type = 'APP_ENGAGEMENT_AD'
         """
@@ -179,7 +230,7 @@ class GoogleAdsVideoSync:
         return stats
 
     def _process_row(self, row, stats, seen_keys, asset_map, ad_key, video_key):
-        """Process row to extract video stats"""
+        """Process row to extract ALL video stats"""
         try:
             ad_group_ad = row.get('adGroupAd', {})
             ad = ad_group_ad.get('ad', {})
@@ -205,6 +256,9 @@ class GoogleAdsVideoSync:
             if not videos:
                 return
             
+            # Campaign details
+            app_setting = campaign.get('appCampaignSetting', {})
+            
             for video in videos:
                 asset_resource = video.get('asset', '')
                 asset_info = asset_map.get(asset_resource, {})
@@ -216,12 +270,17 @@ class GoogleAdsVideoSync:
                 youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
                 
                 if youtube_url in seen_keys:
-                    # Aggregate
+                    # Aggregate metrics for same video
                     for stat in stats:
                         if stat['youtube_url'] == youtube_url:
                             stat['impressions'] += int(metrics.get('impressions', 0))
                             stat['clicks'] += int(metrics.get('clicks', 0))
                             stat['cost'] += float(metrics.get('costMicros', 0)) / 1000000.0
+                            stat['conversions'] += float(metrics.get('conversions', 0))
+                            stat['conversions_value'] += float(metrics.get('conversionsValue', 0))
+                            stat['video_views'] += int(metrics.get('videoViews', 0))
+                            stat['interactions'] += int(metrics.get('interactions', 0))
+                            stat['all_conversions'] += float(metrics.get('allConversions', 0))
                             if effective_status == 'RUNNING':
                                 stat['status'] = 'RUNNING'
                             elif effective_status == 'PAUSED' and stat['status'] != 'RUNNING':
@@ -233,23 +292,116 @@ class GoogleAdsVideoSync:
                 
                 stats.append({
                     'youtube_url': youtube_url,
+                    'youtube_id': youtube_id,
+                    'video_title': asset_info.get('youtube_title', ''),
+                    
+                    # Performance Metrics
                     'impressions': int(metrics.get('impressions', 0)),
                     'clicks': int(metrics.get('clicks', 0)),
                     'cost': float(metrics.get('costMicros', 0)) / 1000000.0,
+                    'conversions': float(metrics.get('conversions', 0)),
+                    'conversions_value': float(metrics.get('conversionsValue', 0)),
+                    'video_views': int(metrics.get('videoViews', 0)),
+                    'interactions': int(metrics.get('interactions', 0)),
+                    'all_conversions': float(metrics.get('allConversions', 0)),
+                    
+                    # Rates (these are averages, not summed)
+                    'ctr': float(metrics.get('ctr', 0)),
+                    'avg_cpc': float(metrics.get('averageCpc', 0)) / 1000000.0,
+                    'avg_cpm': float(metrics.get('averageCpm', 0)) / 1000000.0,
+                    'video_25_rate': float(metrics.get('videoQuartileP25Rate', 0)),
+                    'video_50_rate': float(metrics.get('videoQuartileP50Rate', 0)),
+                    'video_75_rate': float(metrics.get('videoQuartileP75Rate', 0)),
+                    'video_100_rate': float(metrics.get('videoQuartileP100Rate', 0)),
+                    
+                    # Campaign Info
+                    'campaign_name': campaign.get('name', ''),
+                    'campaign_id': str(campaign.get('id', '')),
+                    'campaign_status': c_status,
+                    'campaign_type': campaign.get('advertisingChannelType', ''),
+                    'campaign_subtype': campaign.get('advertisingChannelSubType', ''),
+                    'campaign_start_date': campaign.get('startDate', ''),
+                    'campaign_end_date': campaign.get('endDate', ''),
+                    
+                    # App Info
+                    'package_id': app_setting.get('appId', ''),
+                    'app_store': app_setting.get('appStore', ''),
+                    
+                    # Ad Group Info
+                    'ad_group_name': ad_group.get('name', ''),
+                    'ad_group_id': str(ad_group.get('id', '')),
+                    'ad_group_status': ag_status,
+                    
+                    # Ad Info
+                    'ad_id': str(ad.get('id', '')),
+                    'ad_status': ad_status,
+                    
+                    # Account Info
                     'account_name': customer.get('descriptiveName', ''),
-                    'status': effective_status
+                    'account_id': str(customer.get('id', '')),
+                    
+                    # Status
+                    'status': effective_status,
+                    'approval_status': asset_info.get('approval_status', 'UNKNOWN'),
+                    'review_status': asset_info.get('review_status', 'UNKNOWN')
                 })
         except:
             pass
 
     def ensure_columns_exist(self):
-        """Add Google Ads columns if they don't exist"""
+        """Add ALL Google Ads columns if they don't exist"""
         columns = [
+            # Performance Metrics
             ("google_ads_impressions", "INTEGER"),
             ("google_ads_clicks", "INTEGER"),
             ("google_ads_cost", "FLOAT64"),
-            ("google_ads_accounts", "STRING"),
+            ("google_ads_conversions", "FLOAT64"),
+            ("google_ads_conversions_value", "FLOAT64"),
+            ("google_ads_video_views", "INTEGER"),
+            ("google_ads_interactions", "INTEGER"),
+            ("google_ads_all_conversions", "FLOAT64"),
+            
+            # Rates
+            ("google_ads_ctr", "FLOAT64"),
+            ("google_ads_avg_cpc", "FLOAT64"),
+            ("google_ads_avg_cpm", "FLOAT64"),
+            ("google_ads_video_25_rate", "FLOAT64"),
+            ("google_ads_video_50_rate", "FLOAT64"),
+            ("google_ads_video_75_rate", "FLOAT64"),
+            ("google_ads_video_100_rate", "FLOAT64"),
+            
+            # Campaign Info
+            ("google_ads_campaign_name", "STRING"),
+            ("google_ads_campaign_id", "STRING"),
+            ("google_ads_campaign_status", "STRING"),
+            ("google_ads_campaign_type", "STRING"),
+            ("google_ads_campaign_subtype", "STRING"),
+            ("google_ads_campaign_start_date", "STRING"),
+            ("google_ads_campaign_end_date", "STRING"),
+            
+            # App Info
+            ("google_ads_package_id", "STRING"),
+            ("google_ads_app_store", "STRING"),
+            
+            # Ad Group Info
+            ("google_ads_ad_group_name", "STRING"),
+            ("google_ads_ad_group_id", "STRING"),
+            ("google_ads_ad_group_status", "STRING"),
+            
+            # Ad Info
+            ("google_ads_ad_id", "STRING"),
+            ("google_ads_ad_status", "STRING"),
+            
+            # Account Info
+            ("google_ads_account_name", "STRING"),
+            ("google_ads_account_id", "STRING"),
+            
+            # Status
             ("google_ads_status", "STRING"),
+            ("google_ads_approval_status", "STRING"),
+            ("google_ads_review_status", "STRING"),
+            
+            # Sync Info
             ("google_ads_last_sync", "TIMESTAMP")
         ]
         
@@ -260,11 +412,11 @@ class GoogleAdsVideoSync:
             except:
                 pass
         
-        logger.info("✓ Ensured Google Ads columns exist")
+        logger.info("✓ Ensured all Google Ads columns exist")
 
     def run(self):
         logger.info("=" * 50)
-        logger.info("Google Ads Video Sync Started")
+        logger.info("Google Ads Video Sync - FULL DETAILS")
         logger.info("=" * 50)
         
         self.ensure_columns_exist()
@@ -282,7 +434,7 @@ class GoogleAdsVideoSync:
             return
         
         customer_ids = [cid.strip().replace("-", "") for cid in customer_ids_env.split(',') if cid.strip()]
-        logger.info(f"🔍 Processing {len(customer_ids)} Google Ads accounts...")
+        logger.info(f"🔍 Processing {len(customer_ids)} accounts...")
         
         # Fetch video stats
         all_stats = []
@@ -305,63 +457,129 @@ class GoogleAdsVideoSync:
             logger.info("⚠️ No matching videos found")
             return
         
-        logger.info(f"✓ Matched {len(df_ads)} stats with BigQuery")
+        logger.info(f"✓ Matched {len(df_ads)} videos")
         
-        # Aggregate by youtube_url
-        def agg_status(x):
-            if 'RUNNING' in x.values:
-                return 'RUNNING'
-            elif 'PAUSED' in x.values:
-                return 'PAUSED'
-            return 'REMOVED'
-        
-        df_agg = df_ads.groupby('youtube_url').agg({
+        # For aggregation, sum metrics but keep first value for non-summable fields
+        agg_dict = {
+            # Sum these
             'impressions': 'sum',
             'clicks': 'sum',
             'cost': 'sum',
+            'conversions': 'sum',
+            'conversions_value': 'sum',
+            'video_views': 'sum',
+            'interactions': 'sum',
+            'all_conversions': 'sum',
+            
+            # Average these
+            'ctr': 'mean',
+            'avg_cpc': 'mean',
+            'avg_cpm': 'mean',
+            'video_25_rate': 'mean',
+            'video_50_rate': 'mean',
+            'video_75_rate': 'mean',
+            'video_100_rate': 'mean',
+            
+            # Keep first (representative)
+            'video_title': 'first',
+            'campaign_name': 'first',
+            'campaign_id': 'first',
+            'campaign_status': 'first',
+            'campaign_type': 'first',
+            'campaign_subtype': 'first',
+            'campaign_start_date': 'first',
+            'campaign_end_date': 'first',
+            'package_id': 'first',
+            'app_store': 'first',
+            'ad_group_name': 'first',
+            'ad_group_id': 'first',
+            'ad_group_status': 'first',
+            'ad_id': 'first',
+            'ad_status': 'first',
             'account_name': lambda x: ', '.join(sorted(set(str(v) for v in x if v))),
-            'status': agg_status
-        }).reset_index()
+            'account_id': lambda x: ', '.join(sorted(set(str(v) for v in x if v))),
+            'approval_status': 'first',
+            'review_status': 'first',
+            
+            # Best status
+            'status': lambda x: 'RUNNING' if 'RUNNING' in x.values else ('PAUSED' if 'PAUSED' in x.values else 'REMOVED')
+        }
+        
+        df_agg = df_ads.groupby('youtube_url').agg(agg_dict).reset_index()
         
         logger.info(f"📊 Aggregated to {len(df_agg)} unique videos")
         
         status_counts = df_agg['status'].value_counts().to_dict()
         logger.info(f"   Status: {status_counts}")
         
-        # Upload to temp table then MERGE (much faster than individual updates)
+        # Prepare for upload - rename columns with google_ads_ prefix
+        rename_map = {
+            'impressions': 'google_ads_impressions',
+            'clicks': 'google_ads_clicks',
+            'cost': 'google_ads_cost',
+            'conversions': 'google_ads_conversions',
+            'conversions_value': 'google_ads_conversions_value',
+            'video_views': 'google_ads_video_views',
+            'interactions': 'google_ads_interactions',
+            'all_conversions': 'google_ads_all_conversions',
+            'ctr': 'google_ads_ctr',
+            'avg_cpc': 'google_ads_avg_cpc',
+            'avg_cpm': 'google_ads_avg_cpm',
+            'video_25_rate': 'google_ads_video_25_rate',
+            'video_50_rate': 'google_ads_video_50_rate',
+            'video_75_rate': 'google_ads_video_75_rate',
+            'video_100_rate': 'google_ads_video_100_rate',
+            'campaign_name': 'google_ads_campaign_name',
+            'campaign_id': 'google_ads_campaign_id',
+            'campaign_status': 'google_ads_campaign_status',
+            'campaign_type': 'google_ads_campaign_type',
+            'campaign_subtype': 'google_ads_campaign_subtype',
+            'campaign_start_date': 'google_ads_campaign_start_date',
+            'campaign_end_date': 'google_ads_campaign_end_date',
+            'package_id': 'google_ads_package_id',
+            'app_store': 'google_ads_app_store',
+            'ad_group_name': 'google_ads_ad_group_name',
+            'ad_group_id': 'google_ads_ad_group_id',
+            'ad_group_status': 'google_ads_ad_group_status',
+            'ad_id': 'google_ads_ad_id',
+            'ad_status': 'google_ads_ad_status',
+            'account_name': 'google_ads_account_name',
+            'account_id': 'google_ads_account_id',
+            'status': 'google_ads_status',
+            'approval_status': 'google_ads_approval_status',
+            'review_status': 'google_ads_review_status'
+        }
+        
+        df_upload = df_agg.rename(columns=rename_map)
+        
+        # Drop columns not in rename_map (like video_title, youtube_id which we don't need)
+        cols_to_keep = ['youtube_url'] + list(rename_map.values())
+        df_upload = df_upload[[c for c in cols_to_keep if c in df_upload.columns]]
+        
+        # Upload to temp table then MERGE
         logger.info("💾 Uploading to temp table...")
         
         temp_table_id = f"{self.bq_client.project}.{self.dataset_id}.temp_google_ads_stats"
         
-        # Prepare DataFrame for upload
-        df_upload = df_agg.rename(columns={
-            'impressions': 'google_ads_impressions',
-            'clicks': 'google_ads_clicks',
-            'cost': 'google_ads_cost',
-            'account_name': 'google_ads_accounts',
-            'status': 'google_ads_status'
-        })
-        
-        # Upload to temp table
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         job = self.bq_client.load_table_from_dataframe(df_upload, temp_table_id, job_config=job_config)
         job.result()
         
         logger.info("💾 Merging into main table...")
         
-        # MERGE statement - single fast operation
+        # Build dynamic SET clause from column names
+        set_clauses = []
+        for col in df_upload.columns:
+            if col != 'youtube_url':
+                set_clauses.append(f"T.{col} = S.{col}")
+        set_clauses.append("T.google_ads_last_sync = CURRENT_TIMESTAMP()")
+        
         merge_query = f"""
             MERGE `{self.full_table_id}` T
             USING `{temp_table_id}` S
             ON T.youtube_url = S.youtube_url
             WHEN MATCHED THEN
-                UPDATE SET
-                    T.google_ads_impressions = S.google_ads_impressions,
-                    T.google_ads_clicks = S.google_ads_clicks,
-                    T.google_ads_cost = S.google_ads_cost,
-                    T.google_ads_accounts = S.google_ads_accounts,
-                    T.google_ads_status = S.google_ads_status,
-                    T.google_ads_last_sync = CURRENT_TIMESTAMP()
+                UPDATE SET {', '.join(set_clauses)}
         """
         
         self.bq_client.query(merge_query).result()
@@ -369,7 +587,7 @@ class GoogleAdsVideoSync:
         # Clean up temp table
         self.bq_client.delete_table(temp_table_id, not_found_ok=True)
         
-        logger.info(f"✓ Updated {len(df_agg)} videos in clean_ads_transparency")
+        logger.info(f"✓ Updated {len(df_agg)} videos with FULL details")
         logger.info("=" * 50)
         logger.info("✅ Google Ads Sync Complete!")
         logger.info("=" * 50)
