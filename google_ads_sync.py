@@ -116,6 +116,41 @@ class GoogleAdsVideoSync:
         except:
             return None
 
+    def test_api_connectivity(self):
+        """Test basic API connectivity with simplest possible call"""
+        logger.info("Testing API connectivity...")
+        
+        # Test 1: Try listing accessible customers (simplest call)
+        test_url = f"https://googleads.googleapis.com/{self.api_version}/customers:listAccessibleCustomers"
+        
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "developer-token": self.developer_token,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
+        logger.info(f"  Test URL: {test_url}")
+        
+        try:
+            response = requests.get(test_url, headers=headers)
+            logger.info(f"  Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"  SUCCESS! Accessible customers: {json.dumps(result, indent=2)}")
+                return result.get("resourceNames", [])
+            else:
+                try:
+                    error_json = response.json()
+                    logger.error(f"  API Error (JSON): {json.dumps(error_json, indent=2)}")
+                except:
+                    logger.error(f"  API Error (Text): {response.text[:1000]}")
+                return []
+        except Exception as e:
+            logger.error(f"  Exception: {e}")
+            return []
+
     def search_google_ads(self, customer_id, query):
         """Execute a GAQL query using REST API"""
         # Use the regular search endpoint (not stream)
@@ -237,7 +272,15 @@ class GoogleAdsVideoSync:
         # Initialize BigQuery
         self.init_bigquery()
         
-        # 1. Load video map from BigQuery
+        # Test API connectivity first
+        accessible = self.test_api_connectivity()
+        if not accessible:
+            logger.error("API connectivity test failed. Please check:")
+            logger.error("  1. Google Ads API is enabled in Google Cloud Console")
+            logger.error("  2. Developer token is valid and approved")
+            logger.error("  3. OAuth credentials have correct access")
+            # Continue anyway to see more detailed errors
+
         query = f"SELECT video_id, youtube_url FROM `{self.full_table_id}`"
         df_videos = self.bq_client.query(query).to_dataframe()
         logger.info(f"Loaded {len(df_videos)} videos from BigQuery.")
