@@ -71,7 +71,11 @@ class GoogleAdsVideoSync:
             logger.error(f"Failed to get access token: {response.text}")
             raise Exception("Failed to authenticate with Google")
         
-        return response.json()["access_token"]
+        token = response.json()["access_token"]
+        logger.info(f"Access token obtained successfully (length: {len(token)})")
+        logger.info(f"Developer token: {self.developer_token[:10]}..." if self.developer_token else "Developer token: MISSING!")
+        return token
+
 
     def _make_request(self, endpoint, method="GET", data=None, customer_id=None):
         """Make REST API request to Google Ads"""
@@ -114,8 +118,8 @@ class GoogleAdsVideoSync:
 
     def search_google_ads(self, customer_id, query):
         """Execute a GAQL query using REST API"""
-        endpoint = f"customers/{customer_id}/googleAds:searchStream"
-        data = {"query": query}
+        # Correct endpoint format for Google Ads REST API
+        url = f"https://googleads.googleapis.com/{self.api_version}/customers/{customer_id}/googleAds:searchStream"
         
         headers = {
             "Authorization": f"Bearer {self.access_token}",
@@ -123,7 +127,9 @@ class GoogleAdsVideoSync:
             "Content-Type": "application/json"
         }
         
-        url = f"{self.base_url}/{endpoint}"
+        data = {"query": query}
+        
+        logger.info(f"    Calling: {url}")
         
         try:
             response = requests.post(url, headers=headers, json=data)
