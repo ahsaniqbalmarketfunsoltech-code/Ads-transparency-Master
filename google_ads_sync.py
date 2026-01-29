@@ -39,7 +39,7 @@ class GoogleAdsVideoSync:
                 "client_secret": os.getenv('GOOGLE_ADS_CLIENT_SECRET'),
                 "refresh_token": os.getenv('GOOGLE_ADS_REFRESH_TOKEN'),
                 "developer_token": os.getenv('GOOGLE_ADS_DEVELOPER_TOKEN'),
-                "use_proto_plus": True
+                "use_proto_plus": False
             }
             if os.getenv('GOOGLE_ADS_LOGIN_CUSTOMER_ID'):
                 self.ads_config["login_customer_id"] = os.getenv('GOOGLE_ADS_LOGIN_CUSTOMER_ID')
@@ -58,7 +58,8 @@ class GoogleAdsVideoSync:
 
     def get_client_accounts(self, customer_id):
         """Recursively find all client accounts under a manager account"""
-        ga_service = self.ads_client.get_service("GoogleAdsService")
+        # Force v17 for better compatibility
+        ga_service = self.ads_client.get_service("GoogleAdsService", version="v17")
         query = """
             SELECT
               customer_client.client_customer,
@@ -73,8 +74,8 @@ class GoogleAdsVideoSync:
         
         client_ids = []
         try:
-            search_request = self.ads_client.get_type("SearchGoogleAdsRequest")
-            search_request.customer_id = customer_id
+            search_request = self.ads_client.get_type("SearchGoogleAdsRequest", version="v17")
+            search_request.customer_id = str(customer_id).replace("-", "")
             search_request.query = query
             response = ga_service.search(request=search_request)
             
@@ -82,40 +83,51 @@ class GoogleAdsVideoSync:
                 client = row.customer_client
                 if not client.manager:
                     client_ids.append(str(client.id))
-                elif client.level > 0:
-                    # It's a sub-manager, we could recurse if needed, but level 1 usually covers it
-                    pass
         except Exception as e:
-            logger.warning(f"Error listing clients for manager {customer_id}: {e}")
+            logger.debug(f"Error listing clients for customer {customer_id}: {e}")
             
         return client_ids
 
     def get_accessible_customers(self):
         """Fetch all client account IDs, handling Manager accounts"""
-        customer_service = self.ads_client.get_service("CustomerService")
-        try:
-            customer_resource_names = customer_service.list_accessible_customers()
-        except Exception as e:
-            logger.error(f"Failed to list accessible customers: {e}")
-            return []
-        
         all_client_ids = set()
-        for resource_name in customer_resource_names.resource_names:
-            cid = resource_name.split("/")[-1]
-            # Check if this is a manager or a client
+        
+        # Priority 1: Use login_customer_id if provided
+        login_id = self.ads_config.get("login_customer_id")
+        if login_id:
+            cid = str(login_id).replace("-", "")
+            logger.info(f"Using login_customer_id {cid} as starting point.")
+            all_client_ids.add(cid)
+            # Find sub-accounts if it's a manager
             clients = self.get_client_accounts(cid)
             if clients:
                 all_client_ids.update(clients)
-            else:
-                # Might be a single client account
-                all_client_ids.add(cid)
+
+        # Priority 2: Try Listing all accessible customers
+        try:
+            customer_service = self.ads_client.get_service("CustomerService", version="v17")
+            customer_resource_names = customer_service.list_accessible_customers()
+            
+            for resource_name in customer_resource_names.resource_names:
+                cid = resource_name.split("/")[-1]
+                if cid not in all_client_ids:
+                    # Check if this is a manager or a client
+                    clients = self.get_client_accounts(cid)
+                    if clients:
+                        all_client_ids.update(clients)
+                    else:
+                        all_client_ids.add(cid)
+        except Exception as e:
+            logger.warning(f"Could not list all accessible customers: {e}")
+            if not all_client_ids:
+                logger.error("No accounts found via ListAccessibleCustomers or login_customer_id.")
         
         logger.info(f"Total client accounts to process: {len(all_client_ids)}")
         return list(all_client_ids)
 
     def get_video_stats(self, customer_id):
         """Query Google Ads for video stats including package ID (app_id)"""
-        ga_service = self.ads_client.get_service("GoogleAdsService")
+        ga_service = self.ads_client.get_service("GoogleAdsService", version="v17")
         stats = []
         
         # Query: Assets linked to campaigns or ad groups
@@ -160,8 +172,8 @@ class GoogleAdsVideoSync:
         
         for q in [query, query_campaign]:
             try:
-                search_request = self.ads_client.get_type("SearchGoogleAdsRequest")
-                search_request.customer_id = customer_id
+                search_request = self.ads_client.get_type("SearchGoogleAdsRequest", version="v17")
+                search_request.customer_id = str(customer_id).replace("-", "")
                 search_request.query = q
                 
                 response = ga_service.search(request=search_request)

@@ -6,3 +6,5 @@ requests==2.31.0
 google-cloud-bigquery==3.17.1
 db-dtypes==1.2.0
 google-ads==25.1.0
+grpcio>=1.60.0
+protobuf>=4.25.0
