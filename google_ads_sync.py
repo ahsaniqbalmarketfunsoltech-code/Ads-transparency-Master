@@ -139,11 +139,12 @@ class GoogleAdsVideoSync:
             return None
 
     def get_video_stats(self, customer_id):
-        """Query Google Ads for video stats"""
+        """Query Google Ads for video stats from multiple sources"""
         stats = []
+        seen_keys = set()
         
-        # Query for campaign assets with YouTube videos
-        query = """
+        # Query 1: Campaign-level assets
+        query1 = """
             SELECT
               asset.youtube_video_asset.youtube_video_id,
               campaign.app_campaign_setting.app_id,
@@ -156,43 +157,116 @@ class GoogleAdsVideoSync:
               customer.descriptive_name
             FROM campaign_asset
             WHERE asset.type = 'YOUTUBE_VIDEO'
-              AND metrics.impressions > 0
         """
         
-        logger.info(f"    Querying campaign_asset...")
-        result = self.search(query, customer_id)
+        logger.info(f"    Query 1: campaign_asset (all videos)...")
+        result1 = self.search(query1, customer_id)
         
-        if result['result'] and result['response']:
-            for row in result['response']:
-                try:
-                    asset = row.get('asset', {})
-                    campaign = row.get('campaign', {})
-                    metrics = row.get('metrics', {})
-                    customer = row.get('customer', {})
-                    
-                    youtube_id = asset.get('youtubeVideoAsset', {}).get('youtubeVideoId')
-                    if not youtube_id:
-                        continue
-                    
-                    stats.append({
-                        'youtube_id': youtube_id,
-                        'package_id': campaign.get('appCampaignSetting', {}).get('appId', 'N/A'),
-                        'campaign_id': str(campaign.get('id', '')),
-                        'campaign_name': campaign.get('name', ''),
-                        'impressions': int(metrics.get('impressions', 0)),
-                        'clicks': int(metrics.get('clicks', 0)),
-                        'cost': float(metrics.get('costMicros', 0)) / 1000000.0,
-                        'account_id': str(customer.get('id', '')),
-                        'account_name': customer.get('descriptiveName', ''),
-                        'ad_group_id': 'N/A',
-                        'ad_group_name': 'N/A'
-                    })
-                except Exception as e:
-                    logger.debug(f"Error parsing row: {e}")
-                    continue
+        if result1['result'] and result1['response']:
+            logger.info(f"      Raw rows returned: {len(result1['response'])}")
+            for row in result1['response']:
+                self._process_video_row(row, stats, seen_keys, 'campaign_asset')
+        else:
+            logger.info(f"      No data from campaign_asset")
         
-        logger.info(f"    Found {len(stats)} video stats")
+        # Query 2: Ad Group-level assets  
+        query2 = """
+            SELECT
+              asset.youtube_video_asset.youtube_video_id,
+              campaign.app_campaign_setting.app_id,
+              campaign.id,
+              campaign.name,
+              ad_group.id,
+              ad_group.name,
+              metrics.impressions,
+              metrics.clicks,
+              metrics.cost_micros,
+              customer.id,
+              customer.descriptive_name
+            FROM ad_group_asset
+            WHERE asset.type = 'YOUTUBE_VIDEO'
+        """
+        
+        logger.info(f"    Query 2: ad_group_asset (all videos)...")
+        result2 = self.search(query2, customer_id)
+        
+        if result2['result'] and result2['response']:
+            logger.info(f"      Raw rows returned: {len(result2['response'])}")
+            for row in result2['response']:
+                self._process_video_row(row, stats, seen_keys, 'ad_group_asset')
+        else:
+            logger.info(f"      No data from ad_group_asset")
+        
+        # Query 3: Check what asset types exist in the account
+        query3 = """
+            SELECT
+              asset.type,
+              asset.resource_name
+            FROM asset
+            WHERE asset.type IN ('YOUTUBE_VIDEO', 'MEDIA_BUNDLE', 'IMAGE')
+            LIMIT 20
+        """
+        
+        logger.info(f"    Query 3: Checking what assets exist...")
+        result3 = self.search(query3, customer_id)
+        
+        if result3['result'] and result3['response']:
+            asset_types = {}
+            for row in result3['response']:
+                asset_type = row.get('asset', {}).get('type', 'UNKNOWN')
+                asset_types[asset_type] = asset_types.get(asset_type, 0) + 1
+            logger.info(f"      Asset types found: {asset_types}")
+        else:
+            logger.info(f"      No assets found in account")
+        
+        logger.info(f"    Total video stats for this customer: {len(stats)}")
         return stats
+
+    def _process_video_row(self, row, stats, seen_keys, source):
+        """Process a video row from Google Ads API response"""
+        try:
+            asset = row.get('asset', {})
+            campaign = row.get('campaign', {})
+            metrics = row.get('metrics', {})
+            customer = row.get('customer', {})
+            ad_group = row.get('adGroup', {})
+            
+            youtube_id = asset.get('youtubeVideoAsset', {}).get('youtubeVideoId')
+            if not youtube_id:
+                return
+            
+            # Create dedup key
+            key = (
+                str(customer.get('id', '')),
+                str(campaign.get('id', '')),
+                str(ad_group.get('id', '')),
+                youtube_id
+            )
+            
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            
+            stats.append({
+                'youtube_id': youtube_id,
+                'package_id': campaign.get('appCampaignSetting', {}).get('appId', 'N/A'),
+                'campaign_id': str(campaign.get('id', '')),
+                'campaign_name': campaign.get('name', ''),
+                'impressions': int(metrics.get('impressions', 0)),
+                'clicks': int(metrics.get('clicks', 0)),
+                'cost': float(metrics.get('costMicros', 0)) / 1000000.0,
+                'account_id': str(customer.get('id', '')),
+                'account_name': customer.get('descriptiveName', ''),
+                'ad_group_id': str(ad_group.get('id', 'N/A')),
+                'ad_group_name': ad_group.get('name', 'N/A'),
+                'source': source
+            })
+            
+            logger.info(f"      Found video: {youtube_id} ({source})")
+            
+        except Exception as e:
+            logger.debug(f"Error parsing row: {e}")
+
 
     def init_bigquery(self):
         """Ensure dataset exists"""
