@@ -128,6 +128,8 @@ class GoogleAdsVideoSync:
         try:
             response = requests.post(url, headers=headers, json=data)
             
+            logger.info(f"    API Response Status: {response.status_code}")
+            
             if response.status_code == 200:
                 results = response.json()
                 # searchStream returns an array of result batches
@@ -135,13 +137,19 @@ class GoogleAdsVideoSync:
                 for batch in results:
                     if "results" in batch:
                         all_results.extend(batch["results"])
+                logger.info(f"    Rows returned: {len(all_results)}")
                 return all_results
             else:
-                error_text = response.text[:500] if response.text else "No error message"
-                logger.debug(f"Search failed for {customer_id}: {response.status_code} - {error_text}")
+                # Log the actual error message
+                try:
+                    error_json = response.json()
+                    error_msg = json.dumps(error_json, indent=2)[:1000]
+                except:
+                    error_msg = response.text[:1000] if response.text else "No error message"
+                logger.warning(f"    API Error: {error_msg}")
                 return []
         except Exception as e:
-            logger.debug(f"Search exception for {customer_id}: {e}")
+            logger.error(f"    Request exception: {e}")
             return []
 
     def get_video_stats(self, customer_id):
