@@ -352,23 +352,23 @@ class GoogleAdsVideoSync:
         """Add ALL Google Ads columns if they don't exist"""
         columns = [
             # Performance Metrics
-            ("google_ads_impressions", "INTEGER"),
-            ("google_ads_clicks", "INTEGER"),
-            ("google_ads_cost", "FLOAT64"),
-            ("google_ads_conversions", "FLOAT64"),
-            ("google_ads_conversions_value", "FLOAT64"),
-            ("google_ads_video_views", "INTEGER"),
-            ("google_ads_interactions", "INTEGER"),
-            ("google_ads_all_conversions", "FLOAT64"),
+            ("google_ads_impressions", "STRING"),  # Formatted with commas
+            ("google_ads_clicks", "STRING"),  # Formatted with commas
+            ("google_ads_cost", "STRING"),  # Formatted with $ sign
+            ("google_ads_conversions", "STRING"),  # Formatted number
+            ("google_ads_conversions_value", "STRING"),  # Formatted with $ sign
+            ("google_ads_video_views", "STRING"),  # Formatted with commas
+            ("google_ads_interactions", "STRING"),  # Formatted with commas
+            ("google_ads_all_conversions", "STRING"),  # Formatted number
             
-            # Rates
-            ("google_ads_ctr", "FLOAT64"),
-            ("google_ads_avg_cpc", "FLOAT64"),
-            ("google_ads_avg_cpm", "FLOAT64"),
-            ("google_ads_video_25_rate", "FLOAT64"),
-            ("google_ads_video_50_rate", "FLOAT64"),
-            ("google_ads_video_75_rate", "FLOAT64"),
-            ("google_ads_video_100_rate", "FLOAT64"),
+            # Rates (with % sign)
+            ("google_ads_ctr", "STRING"),  # Formatted with % sign
+            ("google_ads_avg_cpc", "STRING"),  # Formatted with $ sign
+            ("google_ads_avg_cpm", "STRING"),  # Formatted with $ sign
+            ("google_ads_video_25_rate", "STRING"),  # Formatted with % sign
+            ("google_ads_video_50_rate", "STRING"),  # Formatted with % sign
+            ("google_ads_video_75_rate", "STRING"),  # Formatted with % sign
+            ("google_ads_video_100_rate", "STRING"),  # Formatted with % sign
             
             # Campaign Info
             ("google_ads_campaign_name", "STRING"),
@@ -511,6 +511,56 @@ class GoogleAdsVideoSync:
         
         status_counts = df_agg['status'].value_counts().to_dict()
         logger.info(f"   Status: {status_counts}")
+        
+        # Format numbers with currency signs and percentages for better readability
+        def format_number(val):
+            """Format number with commas (e.g., 1,234,567)"""
+            try:
+                return f"{int(val):,}"
+            except:
+                return str(val)
+        
+        def format_currency(val):
+            """Format as currency with $ sign (e.g., $1,234.56)"""
+            try:
+                return f"${float(val):,.2f}"
+            except:
+                return str(val)
+        
+        def format_percentage(val):
+            """Format as percentage with % sign (e.g., 12.34%)"""
+            try:
+                return f"{float(val) * 100:.2f}%"
+            except:
+                return str(val)
+        
+        def format_decimal(val):
+            """Format decimal number (e.g., 12.34)"""
+            try:
+                return f"{float(val):.2f}"
+            except:
+                return str(val)
+        
+        # Apply formatting
+        df_agg['impressions'] = df_agg['impressions'].apply(format_number)
+        df_agg['clicks'] = df_agg['clicks'].apply(format_number)
+        df_agg['cost'] = df_agg['cost'].apply(format_currency)
+        df_agg['conversions'] = df_agg['conversions'].apply(format_decimal)
+        df_agg['conversions_value'] = df_agg['conversions_value'].apply(format_currency)
+        df_agg['video_views'] = df_agg['video_views'].apply(format_number)
+        df_agg['interactions'] = df_agg['interactions'].apply(format_number)
+        df_agg['all_conversions'] = df_agg['all_conversions'].apply(format_decimal)
+        
+        # Format rates with % sign
+        df_agg['ctr'] = df_agg['ctr'].apply(format_percentage)
+        df_agg['avg_cpc'] = df_agg['avg_cpc'].apply(format_currency)
+        df_agg['avg_cpm'] = df_agg['avg_cpm'].apply(format_currency)
+        df_agg['video_25_rate'] = df_agg['video_25_rate'].apply(format_percentage)
+        df_agg['video_50_rate'] = df_agg['video_50_rate'].apply(format_percentage)
+        df_agg['video_75_rate'] = df_agg['video_75_rate'].apply(format_percentage)
+        df_agg['video_100_rate'] = df_agg['video_100_rate'].apply(format_percentage)
+        
+        logger.info("✓ Applied formatting ($ for costs, % for rates, commas for numbers)")
         
         # Prepare for upload - rename columns with google_ads_ prefix
         rename_map = {
