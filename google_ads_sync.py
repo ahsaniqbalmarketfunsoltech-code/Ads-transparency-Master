@@ -133,16 +133,25 @@ class GoogleAdsVideoSync:
         return asset_map
 
     def get_video_stats(self, customer_id):
-        """Query Google Ads for ALL video stats and details with daily segmentation"""
+        """Query Google Ads for video asset performance using ad_group_ad_asset_view
+        
+        This uses the asset view which provides PER-ASSET metrics, not per-ad metrics.
+        Each YouTube video asset gets its own unique cost, clicks, impressions, etc.
+        """
         stats = []
         seen_keys = set()
         
+        # First, get asset info map for YouTube video details
         asset_map = self.get_asset_info_map(customer_id)
         
-        # Query APP_AD with ALL available metrics (lifetime totals)
+        # Query ad_group_ad_asset_view for YOUTUBE_VIDEO assets with per-asset metrics
+        # This gives us accurate metrics for each individual video asset!
         query = """
             SELECT
-              ad_group_ad.ad.app_ad.youtube_videos,
+              ad_group_ad_asset_view.asset,
+              ad_group_ad_asset_view.field_type,
+              ad_group_ad_asset_view.enabled,
+              ad_group_ad_asset_view.performance_label,
               ad_group_ad.ad.id,
               ad_group_ad.status,
               ad_group.id,
@@ -164,74 +173,24 @@ class GoogleAdsVideoSync:
               metrics.cost_micros,
               metrics.conversions,
               metrics.conversions_value,
-              metrics.video_views,
-              metrics.video_quartile_p25_rate,
-              metrics.video_quartile_p50_rate,
-              metrics.video_quartile_p75_rate,
-              metrics.video_quartile_p100_rate,
-              metrics.average_cpc,
-              metrics.average_cpm,
-              metrics.ctr,
               metrics.all_conversions,
-              metrics.interactions
-            FROM ad_group_ad
-            WHERE ad_group_ad.ad.type = 'APP_AD'
+              metrics.average_cpc,
+              metrics.ctr
+            FROM ad_group_ad_asset_view
+            WHERE ad_group_ad_asset_view.field_type = 'YOUTUBE_VIDEO'
         """
         
         result = self.search(query, customer_id)
         if result['result'] and result['response']:
             for row in result['response']:
-                self._process_row(row, stats, seen_keys, asset_map, 'appAd', 'youtubeVideos')
-        
-        # Query APP_ENGAGEMENT_AD (lifetime totals)
-        query2 = """
-            SELECT
-              ad_group_ad.ad.app_engagement_ad.videos,
-              ad_group_ad.ad.id,
-              ad_group_ad.status,
-              ad_group.id,
-              ad_group.name,
-              ad_group.status,
-              campaign.id,
-              campaign.name,
-              campaign.status,
-              campaign.app_campaign_setting.app_id,
-              campaign.app_campaign_setting.app_store,
-              campaign.advertising_channel_type,
-              campaign.advertising_channel_sub_type,
-              campaign.start_date,
-              campaign.end_date,
-              customer.id,
-              customer.descriptive_name,
-              metrics.impressions,
-              metrics.clicks,
-              metrics.cost_micros,
-              metrics.conversions,
-              metrics.conversions_value,
-              metrics.video_views,
-              metrics.video_quartile_p25_rate,
-              metrics.video_quartile_p50_rate,
-              metrics.video_quartile_p75_rate,
-              metrics.video_quartile_p100_rate,
-              metrics.average_cpc,
-              metrics.average_cpm,
-              metrics.ctr,
-              metrics.all_conversions,
-              metrics.interactions
-            FROM ad_group_ad
-            WHERE ad_group_ad.ad.type = 'APP_ENGAGEMENT_AD'
-        """
-        
-        result2 = self.search(query2, customer_id)
-        if result2['result'] and result2['response']:
-            for row in result2['response']:
-                self._process_row(row, stats, seen_keys, asset_map, 'appEngagementAd', 'videos')
+                self._process_asset_view_row(row, stats, seen_keys, asset_map, customer_id)
         
         return stats
 
-    def _process_row(self, row, stats, seen_keys, asset_map, ad_key, video_key):
-        """Process row to extract ALL video stats (lifetime totals)"""
+    def _process_asset_view_row(self, row, stats, seen_keys, asset_map, customer_id):
+        """Process a row from ad_group_ad_asset_view with per-asset metrics"""
         try:
+            asset_view = row.get('adGroupAdAssetView', {})
             ad_group_ad = row.get('adGroupAd', {})
             ad = ad_group_ad.get('ad', {})
             campaign = row.get('campaign', {})
@@ -239,86 +198,103 @@ class GoogleAdsVideoSync:
             customer = row.get('customer', {})
             ad_group = row.get('adGroup', {})
             
-            # DEBUG: Log ad_id and metrics to check for duplicates
-            ad_id = ad.get('id', 'unknown')
-            cost_micros = metrics.get('costMicros', 0)
-            logger.debug(f"Ad {ad_id}: cost_micros={cost_micros}, conversionsValue={metrics.get('conversionsValue', 0)}")
+            # Get asset resource name and look up YouTube info
+            asset_resource = asset_view.get('asset', '')
+            asset_info = asset_map.get(asset_resource, {})
+            youtube_id = asset_info.get('youtube_id')
+            
+            if not youtube_id:
+                return
+            
+            youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
             
             # Get statuses
             ad_status = ad_group_ad.get('status', 'UNKNOWN')
             ag_status = ad_group.get('status', 'UNKNOWN')
             c_status = campaign.get('status', 'UNKNOWN')
+            enabled = asset_view.get('enabled', True)
+            performance_label = asset_view.get('performanceLabel', 'UNKNOWN')
             
             # Determine effective status
             if 'REMOVED' in [ad_status, ag_status, c_status]:
                 effective_status = 'REMOVED'
+            elif not enabled:
+                effective_status = 'PAUSED'
             elif ad_status == 'ENABLED' and ag_status == 'ENABLED' and c_status == 'ENABLED':
                 effective_status = 'RUNNING'
             else:
                 effective_status = 'PAUSED'
             
-            videos = ad.get(ad_key, {}).get(video_key, [])
-            if not videos:
+            # Get ad_id for unique key
+            ad_id = str(ad.get('id', ''))
+            
+            # Create unique key: youtube_url + ad_id (to track same video in different ads)
+            video_ad_key = f"{youtube_url}|{ad_id}"
+            
+            # These are REAL per-asset metrics!
+            impressions = int(metrics.get('impressions', 0))
+            clicks = int(metrics.get('clicks', 0))
+            cost = float(metrics.get('costMicros', 0)) / 1000000.0
+            conversions = float(metrics.get('conversions', 0))
+            conversions_value = float(metrics.get('conversionsValue', 0))
+            all_conversions = float(metrics.get('allConversions', 0))
+            
+            logger.debug(f"Asset {youtube_id}: cost=${cost:.2f}, impressions={impressions}, clicks={clicks}")
+            
+            # Skip if we've already seen this exact video+ad combo
+            if video_ad_key in seen_keys:
                 return
+            seen_keys.add(video_ad_key)
+            
+            # Check if this video already has stats (from another ad in this or another account)
+            existing_stat = None
+            for stat in stats:
+                if stat['youtube_url'] == youtube_url:
+                    existing_stat = stat
+                    break
             
             # Campaign details
             app_setting = campaign.get('appCampaignSetting', {})
             
-            for video in videos:
-                asset_resource = video.get('asset', '')
-                asset_info = asset_map.get(asset_resource, {})
-                youtube_id = asset_info.get('youtube_id')
-                
-                if not youtube_id:
-                    continue
-                
-                youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
-                
-                if youtube_url in seen_keys:
-                    # Aggregate metrics for same video (from multiple accounts/ad groups)
-                    for stat in stats:
-                        if stat['youtube_url'] == youtube_url:
-                            stat['impressions'] += int(metrics.get('impressions', 0))
-                            stat['clicks'] += int(metrics.get('clicks', 0))
-                            stat['cost'] += float(metrics.get('costMicros', 0)) / 1000000.0
-                            stat['conversions'] += float(metrics.get('conversions', 0))
-                            stat['conversions_value'] += float(metrics.get('conversionsValue', 0))
-                            stat['video_views'] += int(metrics.get('videoViews', 0))
-                            stat['interactions'] += int(metrics.get('interactions', 0))
-                            stat['all_conversions'] += float(metrics.get('allConversions', 0))
-                            if effective_status == 'RUNNING':
-                                stat['status'] = 'RUNNING'
-                            elif effective_status == 'PAUSED' and stat['status'] != 'RUNNING':
-                                stat['status'] = 'PAUSED'
-                            break
-                    continue
-                
-                seen_keys.add(youtube_url)
-                
-                # Add new video stats
+            if existing_stat:
+                # Same video in another ad - SUM the metrics
+                existing_stat['impressions'] += impressions
+                existing_stat['clicks'] += clicks
+                existing_stat['cost'] += cost
+                existing_stat['conversions'] += conversions
+                existing_stat['conversions_value'] += conversions_value
+                existing_stat['all_conversions'] += all_conversions
+                existing_stat['ads_count'] = existing_stat.get('ads_count', 1) + 1
+                if effective_status == 'RUNNING':
+                    existing_stat['status'] = 'RUNNING'
+                elif effective_status == 'PAUSED' and existing_stat['status'] != 'RUNNING':
+                    existing_stat['status'] = 'PAUSED'
+            else:
+                # Add new video stats with REAL per-asset metrics
                 stats.append({
                     'youtube_url': youtube_url,
                     'youtube_id': youtube_id,
                     'video_title': asset_info.get('youtube_title', ''),
+                    'ads_count': 1,  # Track how many ads this video appears in
                     
-                    # Performance Metrics
-                    'impressions': int(metrics.get('impressions', 0)),
-                    'clicks': int(metrics.get('clicks', 0)),
-                    'cost': float(metrics.get('costMicros', 0)) / 1000000.0,
-                    'conversions': float(metrics.get('conversions', 0)),
-                    'conversions_value': float(metrics.get('conversionsValue', 0)),
-                    'video_views': int(metrics.get('videoViews', 0)),
-                    'interactions': int(metrics.get('interactions', 0)),
-                    'all_conversions': float(metrics.get('allConversions', 0)),
+                    # Performance Metrics - REAL per-asset values!
+                    'impressions': impressions,
+                    'clicks': clicks,
+                    'cost': cost,
+                    'conversions': conversions,
+                    'conversions_value': conversions_value,
+                    'video_views': 0,  # Not available in asset view
+                    'interactions': 0,  # Not available in asset view
+                    'all_conversions': all_conversions,
                     
-                    # Rates (these are averages, not summed)
+                    # Rates
                     'ctr': float(metrics.get('ctr', 0)),
                     'avg_cpc': float(metrics.get('averageCpc', 0)) / 1000000.0,
-                    'avg_cpm': float(metrics.get('averageCpm', 0)) / 1000000.0,
-                    'video_25_rate': float(metrics.get('videoQuartileP25Rate', 0)),
-                    'video_50_rate': float(metrics.get('videoQuartileP50Rate', 0)),
-                    'video_75_rate': float(metrics.get('videoQuartileP75Rate', 0)),
-                    'video_100_rate': float(metrics.get('videoQuartileP100Rate', 0)),
+                    'avg_cpm': 0,  # Not available in asset view
+                    'video_25_rate': 0,  # Not available in asset view
+                    'video_50_rate': 0,
+                    'video_75_rate': 0,
+                    'video_100_rate': 0,
                     
                     # Campaign Info
                     'campaign_name': campaign.get('name', ''),
@@ -339,20 +315,22 @@ class GoogleAdsVideoSync:
                     'ad_group_status': ag_status,
                     
                     # Ad Info
-                    'ad_id': str(ad.get('id', '')),
+                    'ad_id': ad_id,
                     'ad_status': ad_status,
                     
                     # Account Info
                     'account_name': customer.get('descriptiveName', ''),
                     'account_id': str(customer.get('id', '')),
                     
-                    # Status with user-friendly labels
+                    # Status fields
                     'status': effective_status,
-                    'approval_status': asset_info.get('approval_status', 'N/A').replace('_', ' '),
-                    'review_status': 'PENDING' if asset_info.get('review_status') == 'UNDER_REVIEW' else asset_info.get('review_status', 'N/A')
+                    'performance_label': performance_label,
+                    'approval_status': asset_info.get('approval_status', 'UNKNOWN'),
+                    'review_status': asset_info.get('review_status', 'UNKNOWN')
                 })
-        except:
-            pass
+                
+        except Exception as e:
+            logger.debug(f"Error processing asset view row: {e}")
 
     def ensure_columns_exist(self):
         """Add ALL Google Ads columns. Only drop and recreate if type is not STRING."""
@@ -423,6 +401,8 @@ class GoogleAdsVideoSync:
             ("google_ads_status", "STRING"),
             ("google_ads_approval_status", "STRING"),
             ("google_ads_review_status", "STRING"),
+            ("google_ads_performance_label", "STRING"),  # Asset performance rating
+            ("google_ads_ads_count", "STRING"),  # How many ads this video appears in
             ("google_ads_date", "DATE"),  # NEW: Date for daily data filtering
             ("google_ads_last_sync", "TIMESTAMP")
         ]
@@ -534,7 +514,8 @@ class GoogleAdsVideoSync:
                 'PENDING' if 'PENDING' in x.values 
                 else ('REVIEWED' if 'REVIEWED' in x.values 
                 else x.iloc[0])  # Keep original if all same (including UNKNOWN)
-            )
+            ),
+            'performance_label': 'first'  # Keep first performance label
         }
         
         # Group by youtube_url only for lifetime totals (one row per video)
@@ -656,7 +637,9 @@ class GoogleAdsVideoSync:
             'account_id': 'google_ads_account_id',
             'status': 'google_ads_status',
             'approval_status': 'google_ads_approval_status',
-            'review_status': 'google_ads_review_status'
+            'review_status': 'google_ads_review_status',
+            'performance_label': 'google_ads_performance_label',
+            'ads_count': 'google_ads_ads_count'
         }
         
         df_upload = df_agg.rename(columns=rename_map)
