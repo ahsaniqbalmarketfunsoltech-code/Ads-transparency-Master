@@ -349,102 +349,86 @@ class GoogleAdsVideoSync:
             pass
 
     def ensure_columns_exist(self):
-        """Add ALL Google Ads columns if they don't exist. Drop and recreate if type mismatch."""
+        """Add ALL Google Ads columns. Only drop and recreate if type is not STRING."""
         
-        # Columns that need to be STRING (were previously numeric)
-        # These need to be dropped first if they exist as wrong type
-        columns_to_convert = [
-            "google_ads_impressions",
-            "google_ads_clicks", 
-            "google_ads_cost",
-            "google_ads_conversions",
-            "google_ads_conversions_value",
-            "google_ads_video_views",
-            "google_ads_interactions",
-            "google_ads_all_conversions",
-            "google_ads_ctr",
-            "google_ads_avg_cpc",
-            "google_ads_avg_cpm",
-            "google_ads_video_25_rate",
-            "google_ads_video_50_rate",
-            "google_ads_video_75_rate",
-            "google_ads_video_100_rate",
+        # Get existing column types to avoid unnecessary drops
+        table = self.bq_client.get_table(self.full_table_id)
+        existing_cols = {field.name: field.field_type for field in table.schema}
+        
+        # Performance Metrics that need to be STRING for formatted display
+        metrics_to_format = [
+            "google_ads_impressions", "google_ads_clicks", "google_ads_cost",
+            "google_ads_conversions", "google_ads_conversions_value",
+            "google_ads_video_views", "google_ads_interactions",
+            "google_ads_all_conversions", "google_ads_ctr", "google_ads_avg_cpc",
+            "google_ads_avg_cpm", "google_ads_video_25_rate",
+            "google_ads_video_50_rate", "google_ads_video_75_rate",
+            "google_ads_video_100_rate"
         ]
         
-        # First, drop columns that were numeric but need to be STRING
-        logger.info("Checking column types...")
-        for col_name in columns_to_convert:
-            try:
-                # Try to drop the column (it will be recreated as STRING)
-                drop_query = f"ALTER TABLE `{self.full_table_id}` DROP COLUMN IF EXISTS {col_name}"
-                self.bq_client.query(drop_query).result()
-            except Exception as e:
-                # Column might not exist, that's fine
-                pass
-        
+        # 1. Drop only if the type is NOT string (one-time migration)
+        for col in metrics_to_format:
+            if col in existing_cols and existing_cols[col] != 'STRING':
+                logger.info(f"Converting column {col} to STRING...")
+                try:
+                    self.bq_client.query(f"ALTER TABLE `{self.full_table_id}` DROP COLUMN {col}").result()
+                    del existing_cols[col] # Mark as removed
+                except Exception as e:
+                    logger.error(f"Failed to drop {col}: {e}")
+
+        # 2. Define all columns with their correct metadata
         columns = [
-            # Performance Metrics (now STRING for formatted display)
-            ("google_ads_impressions", "STRING"),  # Formatted with commas
-            ("google_ads_clicks", "STRING"),  # Formatted with commas
-            ("google_ads_cost", "STRING"),  # Formatted with $ sign
-            ("google_ads_conversions", "STRING"),  # Formatted number
-            ("google_ads_conversions_value", "STRING"),  # Formatted with $ sign
-            ("google_ads_video_views", "STRING"),  # Formatted with commas
-            ("google_ads_interactions", "STRING"),  # Formatted with commas
-            ("google_ads_all_conversions", "STRING"),  # Formatted number
+            # Counts (Comma separated)
+            ("google_ads_impressions", "STRING"),
+            ("google_ads_clicks", "STRING"),
+            ("google_ads_video_views", "STRING"),
+            ("google_ads_interactions", "STRING"),
             
-            # Rates (with % sign)
-            ("google_ads_ctr", "STRING"),  # Formatted with % sign
-            ("google_ads_avg_cpc", "STRING"),  # Formatted with $ sign
-            ("google_ads_avg_cpm", "STRING"),  # Formatted with $ sign
-            ("google_ads_video_25_rate", "STRING"),  # Formatted with % sign
-            ("google_ads_video_50_rate", "STRING"),  # Formatted with % sign
-            ("google_ads_video_75_rate", "STRING"),  # Formatted with % sign
-            ("google_ads_video_100_rate", "STRING"),  # Formatted with % sign
+            # Monetary (With $ sign)
+            ("google_ads_cost", "STRING"),
+            ("google_ads_conversions_value", "STRING"),
             
-            # Campaign Info
+            # Decimals (No $ sign, plain decimal like 0.02)
+            ("google_ads_avg_cpc", "STRING"),
+            ("google_ads_avg_cpm", "STRING"),
+            ("google_ads_conversions", "STRING"),
+            ("google_ads_all_conversions", "STRING"),
+            
+            # Percentages (With % sign)
+            ("google_ads_ctr", "STRING"),
+            ("google_ads_video_25_rate", "STRING"),
+            ("google_ads_video_50_rate", "STRING"),
+            ("google_ads_video_75_rate", "STRING"),
+            ("google_ads_video_100_rate", "STRING"),
+            
+            # Campaign & Metadata
             ("google_ads_campaign_name", "STRING"),
             ("google_ads_campaign_id", "STRING"),
             ("google_ads_campaign_status", "STRING"),
             ("google_ads_campaign_type", "STRING"),
             ("google_ads_campaign_subtype", "STRING"),
-            ("google_ads_campaign_start_date", "STRING"),
-            ("google_ads_campaign_end_date", "STRING"),
-            
-            # App Info
             ("google_ads_package_id", "STRING"),
             ("google_ads_app_store", "STRING"),
-            
-            # Ad Group Info
             ("google_ads_ad_group_name", "STRING"),
             ("google_ads_ad_group_id", "STRING"),
-            ("google_ads_ad_group_status", "STRING"),
-            
-            # Ad Info
-            ("google_ads_ad_id", "STRING"),
-            ("google_ads_ad_status", "STRING"),
-            
-            # Account Info
             ("google_ads_account_name", "STRING"),
             ("google_ads_account_id", "STRING"),
-            
-            # Status
             ("google_ads_status", "STRING"),
             ("google_ads_approval_status", "STRING"),
             ("google_ads_review_status", "STRING"),
-            
-            # Sync Info
             ("google_ads_last_sync", "TIMESTAMP")
         ]
         
         for col_name, col_type in columns:
-            try:
-                q = f"ALTER TABLE `{self.full_table_id}` ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-                self.bq_client.query(q).result()
-            except:
-                pass
+            if col_name not in existing_cols:
+                try:
+                    q = f"ALTER TABLE `{self.full_table_id}` ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                    self.bq_client.query(q).result()
+                    logger.info(f"Added column: {col_name}")
+                except Exception as e:
+                    logger.debug(f"Could not add {col_name}: {e}")
         
-        logger.info("✓ Ensured all Google Ads columns exist (STRING type for formatted values)")
+        logger.info("✓ Smart column check complete. All metrics have separate STRING columns.")
 
     def run(self):
         logger.info("=" * 50)
@@ -585,14 +569,15 @@ class GoogleAdsVideoSync:
         
         # Format rates with % sign
         df_agg['ctr'] = df_agg['ctr'].apply(format_percentage)
-        df_agg['avg_cpc'] = df_agg['avg_cpc'].apply(format_currency)
-        df_agg['avg_cpm'] = df_agg['avg_cpm'].apply(format_currency)
+        # For CPC and CPM, show as plain decimal without $ sign per user request
+        df_agg['avg_cpc'] = df_agg['avg_cpc'].apply(format_decimal)
+        df_agg['avg_cpm'] = df_agg['avg_cpm'].apply(format_decimal)
         df_agg['video_25_rate'] = df_agg['video_25_rate'].apply(format_percentage)
         df_agg['video_50_rate'] = df_agg['video_50_rate'].apply(format_percentage)
         df_agg['video_75_rate'] = df_agg['video_75_rate'].apply(format_percentage)
         df_agg['video_100_rate'] = df_agg['video_100_rate'].apply(format_percentage)
         
-        logger.info("✓ Applied formatting ($ for costs, % for rates, commas for numbers)")
+        logger.info("✓ Applied formatting (Plain decimals for CPC/CPM, $ for costs, % for rates)")
         
         # Prepare for upload - rename columns with google_ads_ prefix
         rename_map = {
