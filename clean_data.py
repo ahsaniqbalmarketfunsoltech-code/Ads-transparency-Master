@@ -433,9 +433,18 @@ class DataCleaner:
             logger.info("No data to sync.")
 
     def upload_to_bq(self, df):
-        """Uploads full DataFrame to BigQuery (Free Tier Compatible)"""
+        """Uploads DataFrame to BigQuery using MERGE to preserve existing columns (like Google Ads data)"""
         if df.empty: return
 
+        # Ensure expected columns exist and handle NaN values
+        df = df.copy()
+        df['views'] = df['views'].fillna(0).astype(int)
+        df['upload_time'] = df['upload_time'].fillna('').astype(str)
+        df['last_updated'] = pd.to_datetime(df['last_updated'], utc=True)
+        
+        # Upload to temp table first
+        temp_table_id = f"{self.project_id}.{self.dataset_id}.temp_clean_data_staging"
+        
         job_config = bigquery.LoadJobConfig(
             schema=[
                 bigquery.SchemaField("video_id", "STRING"),
@@ -447,12 +456,44 @@ class DataCleaner:
                 bigquery.SchemaField("upload_time", "STRING"),
                 bigquery.SchemaField("last_updated", "TIMESTAMP"),
             ],
-            write_disposition="WRITE_TRUNCATE" # Overwrites table with the full combined data
+            write_disposition="WRITE_TRUNCATE"  # Overwrite temp table is fine
         )
         
-        logger.info(f"Uploading {len(df)} total rows to {self.full_table_id}...")
-        job = self.bq_client.load_table_from_dataframe(df, self.full_table_id, job_config=job_config)
+        logger.info(f"Uploading {len(df)} rows to temp table...")
+        job = self.bq_client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
         job.result()
+        
+        # Use MERGE to insert new rows and update only specific columns for existing rows
+        # This preserves all Google Ads columns (google_ads_impressions, google_ads_clicks, etc.)
+        merge_query = f"""
+            MERGE `{self.full_table_id}` T
+            USING `{temp_table_id}` S
+            ON T.video_id = S.video_id
+            WHEN MATCHED THEN
+                UPDATE SET
+                    T.youtube_url = S.youtube_url,
+                    T.views = CASE 
+                        WHEN S.views > 0 THEN S.views 
+                        WHEN T.views IS NOT NULL AND T.views > 0 THEN T.views
+                        ELSE S.views 
+                    END,
+                    T.upload_time = CASE 
+                        WHEN S.upload_time != '' AND S.upload_time IS NOT NULL THEN S.upload_time 
+                        WHEN T.upload_time IS NOT NULL AND T.upload_time != '' THEN T.upload_time
+                        ELSE S.upload_time 
+                    END,
+                    T.last_updated = S.last_updated
+            WHEN NOT MATCHED THEN
+                INSERT (video_id, youtube_url, app_link, app_name, advertiser_name, views, upload_time, last_updated)
+                VALUES (S.video_id, S.youtube_url, S.app_link, S.app_name, S.advertiser_name, S.views, S.upload_time, S.last_updated)
+        """
+        
+        logger.info("Merging data into main table (preserving Google Ads columns)...")
+        self.bq_client.query(merge_query).result()
+        
+        # Clean up temp table
+        self.bq_client.delete_table(temp_table_id, not_found_ok=True)
+        
         logger.info("✓ BigQuery Sync Complete!")
 
 def main():
