@@ -324,113 +324,55 @@ class DataCleaner:
         df_sheet = pd.DataFrame(data).drop_duplicates(subset=['video_id'])
         logger.info(f"Found {len(df_sheet)} unique valid videos in Sheet.")
 
-        # 3. Get Existing Data from BigQuery
-        df_bq = self.get_bq_state()
+        # 3. Get existing video IDs and their stats from BigQuery
+        existing_data = self.get_bq_state()
+        existing_ids_with_stats = set()
+        incomplete_ids = set()
         
-        # FIX: Ensure all existing BigQuery rows use proper YouTube links
-        if not df_bq.empty:
-            logger.info("Normalizing URLs for existing BigQuery records...")
-            def fix_url(row):
-                if 'adstransparency.google.com' in str(row['youtube_url']):
-                    yt_id = self.hex_to_youtube_id(row['video_id'])
-                    return f"https://www.youtube.com/watch?v={yt_id}" if yt_id else row['youtube_url']
-                return row['youtube_url']
-            
-            df_bq['youtube_url'] = df_bq.apply(fix_url, axis=1)
+        if not existing_data.empty:
+            for _, row in existing_data.iterrows():
+                vid = row['video_id']
+                views = row.get('views')
+                upload_time = row.get('upload_time')
+                
+                # Check if this video has complete stats
+                has_stats = (views is not None and views > 0) or (upload_time and upload_time not in ['', 'None', None])
+                
+                if has_stats:
+                    existing_ids_with_stats.add(vid)
+                else:
+                    incomplete_ids.add(vid)
         
-        # 4. Identify videos that need YouTube stats:
-        #    a) NEW videos (not in BQ)
-        #    b) INCOMPLETE videos (in BQ but views=0/null OR upload_time is empty)
+        # 4. Identify videos needing YouTube API calls
+        sheet_ids = set(df_sheet['video_id'].tolist())
+        new_ids = sheet_ids - existing_ids_with_stats - incomplete_ids  # Truly new
         
-        existing_ids = df_bq['video_id'].tolist() if not df_bq.empty else []
+        # Videos to fetch: new ones + incomplete ones that are still in the sheet
+        videos_to_fetch = list(new_ids) + list(incomplete_ids & sheet_ids)
         
-        # New videos from sheet
-        df_new = df_sheet[~df_sheet['video_id'].isin(existing_ids)].copy()
-        logger.info(f"New videos: {len(df_new)}")
+        logger.info(f"New videos: {len(new_ids)}")
+        logger.info(f"Incomplete videos (retry): {len(incomplete_ids & sheet_ids)}")
+        logger.info(f"Total videos to fetch YouTube stats: {len(videos_to_fetch)}")
         
-        # Incomplete videos already in BQ (need retry)
-        df_incomplete = pd.DataFrame()
-        if not df_bq.empty:
-            # Find rows where views is 0/null OR upload_time is empty/null
-            incomplete_mask = (
-                (df_bq['views'].isna()) | 
-                (df_bq['views'] == 0) | 
-                (df_bq['upload_time'].isna()) | 
-                (df_bq['upload_time'] == '') |
-                (df_bq['upload_time'] == 'None')
-            )
-            df_incomplete = df_bq[incomplete_mask].copy()
-            logger.info(f"Incomplete videos (missing views/upload_time): {len(df_incomplete)}")
-        
-        # Combine: videos needing YouTube API fetch
-        videos_to_fetch = []
-        if not df_new.empty:
-            videos_to_fetch.extend(df_new['video_id'].tolist())
-        if not df_incomplete.empty:
-            videos_to_fetch.extend(df_incomplete['video_id'].tolist())
-        
-        videos_to_fetch = list(set(videos_to_fetch))  # Deduplicate
-        logger.info(f"Total videos to fetch YouTube stats for: {len(videos_to_fetch)}")
-        
+        # 5. Fetch YouTube Stats for videos that need it
+        stats_map = {}
         if videos_to_fetch:
-            # 5. Fetch YouTube Stats
             stats_map = self.get_youtube_stats_batch(videos_to_fetch)
-            
-            # Apply stats to NEW videos
-            if not df_new.empty:
-                df_new['views'] = df_new['video_id'].map(lambda x: stats_map.get(x, (0, ""))[0])
-                df_new['upload_time'] = df_new['video_id'].map(lambda x: stats_map.get(x, (0, ""))[1])
-                df_new['last_updated'] = datetime.now(timezone.utc)
-            
-            # Update stats for INCOMPLETE videos in BQ data
-            if not df_incomplete.empty:
-                for vid in df_incomplete['video_id'].tolist():
-                    if vid in stats_map:
-                        views, upload_time = stats_map[vid]
-                        df_bq.loc[df_bq['video_id'] == vid, 'views'] = views if views else 0
-                        df_bq.loc[df_bq['video_id'] == vid, 'upload_time'] = upload_time if upload_time else ''
-                        df_bq.loc[df_bq['video_id'] == vid, 'last_updated'] = datetime.now(timezone.utc)
-                        # Also update youtube_url to proper YouTube link
-                        yt_id = self.hex_to_youtube_id(vid)
-                        if yt_id:
-                            df_bq.loc[df_bq['video_id'] == vid, 'youtube_url'] = f"https://www.youtube.com/watch?v={yt_id}"
-            
-        # Combine: existing BQ data (updated) + new videos
-        if not df_bq.empty:
-            df_bq['last_updated'] = pd.to_datetime(df_bq['last_updated'])
-            if not df_new.empty:
-                df_final = pd.concat([df_bq, df_new], ignore_index=True)
-            else:
-                df_final = df_bq
-        else:
-            df_final = df_new
+        
+        # 6. Apply stats to DataFrame
+        videos_to_fetch_set = set(videos_to_fetch)
+        df_sheet['views'] = df_sheet['video_id'].map(
+            lambda x: stats_map.get(x, (0, ""))[0] if x in videos_to_fetch_set else 0
+        )
+        df_sheet['upload_time'] = df_sheet['video_id'].map(
+            lambda x: stats_map.get(x, (0, ""))[1] if x in videos_to_fetch_set else ""
+        )
+        df_sheet['last_updated'] = datetime.now(timezone.utc)
 
-        if videos_to_fetch:
-            # 5. Fetch YouTube Stats
-            stats_map = self.get_youtube_stats_batch(videos_to_fetch)
-            
-            # Apply stats to NEW videos in the combined dataframe
-            mask_new = df_final['video_id'].isin(df_new['video_id']) if not df_new.empty else pd.Series([False]*len(df_final))
-            df_final.loc[mask_new, 'views'] = df_final.loc[mask_new, 'video_id'].map(lambda x: stats_map.get(x, (0, ""))[0])
-            df_final.loc[mask_new, 'upload_time'] = df_final.loc[mask_new, 'video_id'].map(lambda x: stats_map.get(x, (0, ""))[1])
-            df_final.loc[mask_new, 'last_updated'] = datetime.now(timezone.utc)
-            
-            # Update stats for INCOMPLETE videos in the combined dataframe
-            if not df_incomplete.empty:
-                mask_inc = df_final['video_id'].isin(df_incomplete['video_id'])
-                for vid in df_incomplete['video_id'].tolist():
-                    if vid in stats_map:
-                        views, upload_time = stats_map[vid]
-                        df_final.loc[df_final['video_id'] == vid, 'views'] = views if views else 0
-                        df_final.loc[df_final['video_id'] == vid, 'upload_time'] = upload_time if upload_time else ''
-                        df_final.loc[df_final['video_id'] == vid, 'last_updated'] = datetime.now(timezone.utc)
+        # 7. Upload to BigQuery using MERGE (this preserves Google Ads columns)
+        self.upload_to_bq(df_sheet)
+        logger.info(f"Processed {len(df_sheet)} videos.")
 
-        # 7. ALWAYS upload the full combined dataset back to BigQuery
-        # This ensuring normalization (URL fixes) happens even if no new stats were fetched
-        if not df_final.empty:
-            self.upload_to_bq(df_final)
-        else:
-            logger.info("No data to sync.")
 
     def upload_to_bq(self, df):
         """Uploads DataFrame to BigQuery using MERGE to preserve existing columns (like Google Ads data)"""
