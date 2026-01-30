@@ -349,9 +349,41 @@ class GoogleAdsVideoSync:
             pass
 
     def ensure_columns_exist(self):
-        """Add ALL Google Ads columns if they don't exist"""
+        """Add ALL Google Ads columns if they don't exist. Drop and recreate if type mismatch."""
+        
+        # Columns that need to be STRING (were previously numeric)
+        # These need to be dropped first if they exist as wrong type
+        columns_to_convert = [
+            "google_ads_impressions",
+            "google_ads_clicks", 
+            "google_ads_cost",
+            "google_ads_conversions",
+            "google_ads_conversions_value",
+            "google_ads_video_views",
+            "google_ads_interactions",
+            "google_ads_all_conversions",
+            "google_ads_ctr",
+            "google_ads_avg_cpc",
+            "google_ads_avg_cpm",
+            "google_ads_video_25_rate",
+            "google_ads_video_50_rate",
+            "google_ads_video_75_rate",
+            "google_ads_video_100_rate",
+        ]
+        
+        # First, drop columns that were numeric but need to be STRING
+        logger.info("Checking column types...")
+        for col_name in columns_to_convert:
+            try:
+                # Try to drop the column (it will be recreated as STRING)
+                drop_query = f"ALTER TABLE `{self.full_table_id}` DROP COLUMN IF EXISTS {col_name}"
+                self.bq_client.query(drop_query).result()
+            except Exception as e:
+                # Column might not exist, that's fine
+                pass
+        
         columns = [
-            # Performance Metrics
+            # Performance Metrics (now STRING for formatted display)
             ("google_ads_impressions", "STRING"),  # Formatted with commas
             ("google_ads_clicks", "STRING"),  # Formatted with commas
             ("google_ads_cost", "STRING"),  # Formatted with $ sign
@@ -412,7 +444,7 @@ class GoogleAdsVideoSync:
             except:
                 pass
         
-        logger.info("✓ Ensured all Google Ads columns exist")
+        logger.info("✓ Ensured all Google Ads columns exist (STRING type for formatted values)")
 
     def run(self):
         logger.info("=" * 50)
