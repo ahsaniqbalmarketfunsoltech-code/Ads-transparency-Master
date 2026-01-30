@@ -120,15 +120,15 @@ class GoogleAdsVideoSync:
                 youtube_id = yt_asset.get('youtubeVideoId', '')
                 youtube_title = yt_asset.get('youtubeVideoTitle', '')
                 policy = asset.get('policySummary', {})
-                approval_status = policy.get('approvalStatus', 'UNKNOWN')
-                review_status = policy.get('reviewStatus', 'UNKNOWN')
+                approval_status = policy.get('approvalStatus', 'N/A')
+                review_status = policy.get('reviewStatus', 'N/A')
                 
                 if resource_name and youtube_id:
                     asset_map[resource_name] = {
                         'youtube_id': youtube_id,
                         'youtube_title': youtube_title,
-                        'approval_status': approval_status,
-                        'review_status': review_status
+                        'approval_status': approval_status if approval_status else 'N/A',
+                        'review_status': review_status if review_status else 'N/A'
                     }
         return asset_map
 
@@ -290,6 +290,7 @@ class GoogleAdsVideoSync:
                 
                 seen_keys.add(youtube_url)
                 
+                # Status Handling
                 stats.append({
                     'youtube_url': youtube_url,
                     'youtube_id': youtube_id,
@@ -340,10 +341,10 @@ class GoogleAdsVideoSync:
                     'account_name': customer.get('descriptiveName', ''),
                     'account_id': str(customer.get('id', '')),
                     
-                    # Status
+                    # Status with user-friendly labels
                     'status': effective_status,
-                    'approval_status': asset_info.get('approval_status', 'UNKNOWN'),
-                    'review_status': asset_info.get('review_status', 'UNKNOWN')
+                    'approval_status': asset_info.get('approval_status', 'N/A').replace('_', ' '),
+                    'review_status': 'PENDING' if asset_info.get('review_status') == 'UNDER_REVIEW' else asset_info.get('review_status', 'N/A')
                 })
         except:
             pass
@@ -514,11 +515,19 @@ class GoogleAdsVideoSync:
             'ad_status': 'first',
             'account_name': lambda x: ', '.join(sorted(set(str(v) for v in x if v))),
             'account_id': lambda x: ', '.join(sorted(set(str(v) for v in x if v))),
-            'approval_status': 'first',
-            'review_status': 'first',
-            
-            # Best status
-            'status': lambda x: 'RUNNING' if 'RUNNING' in x.values else ('PAUSED' if 'PAUSED' in x.values else 'REMOVED')
+            # Best overall statuses - handle UNKNOWN properly
+            'status': lambda x: 'RUNNING' if 'RUNNING' in x.values else ('PAUSED' if 'PAUSED' in x.values else 'REMOVED'),
+            'approval_status': lambda x: (
+                'DISAPPROVED' if 'DISAPPROVED' in x.values 
+                else ('APPROVED' if 'APPROVED' in x.values 
+                else ('APPROVED LIMITED' if 'APPROVED LIMITED' in x.values
+                else x.iloc[0]))  # Keep original if all same (including UNKNOWN)
+            ),
+            'review_status': lambda x: (
+                'PENDING' if 'PENDING' in x.values 
+                else ('REVIEWED' if 'REVIEWED' in x.values 
+                else x.iloc[0])  # Keep original if all same (including UNKNOWN)
+            )
         }
         
         df_agg = df_ads.groupby('youtube_url').agg(agg_dict).reset_index()
@@ -654,7 +663,17 @@ class GoogleAdsVideoSync:
         # Clean up temp table
         self.bq_client.delete_table(temp_table_id, not_found_ok=True)
         
-        logger.info(f"✓ Updated {len(df_agg)} videos with FULL details")
+        # Set status to PENDING for videos NOT in Google Ads (no status yet)
+        logger.info("📝 Setting PENDING status for videos not in Google Ads...")
+        pending_query = f"""
+            UPDATE `{self.full_table_id}`
+            SET google_ads_status = 'PENDING'
+            WHERE google_ads_status IS NULL OR google_ads_status = ''
+        """
+        self.bq_client.query(pending_query).result()
+        
+        logger.info(f"✓ Updated {len(df_agg)} videos with Google Ads data")
+        logger.info("✓ Videos not in Google Ads marked as PENDING")
         logger.info("=" * 50)
         logger.info("✅ Google Ads Sync Complete!")
         logger.info("=" * 50)
