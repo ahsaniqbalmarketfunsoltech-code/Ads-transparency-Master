@@ -139,10 +139,9 @@ class GoogleAdsVideoSync:
         
         asset_map = self.get_asset_info_map(customer_id)
         
-        # Query APP_AD with ALL available metrics + DATE SEGMENT
+        # Query APP_AD with ALL available metrics (lifetime totals)
         query = """
             SELECT
-              segments.date,
               ad_group_ad.ad.app_ad.youtube_videos,
               ad_group_ad.ad.id,
               ad_group_ad.status,
@@ -177,7 +176,6 @@ class GoogleAdsVideoSync:
               metrics.interactions
             FROM ad_group_ad
             WHERE ad_group_ad.ad.type = 'APP_AD'
-              AND segments.date DURING LAST_30_DAYS
         """
         
         result = self.search(query, customer_id)
@@ -185,10 +183,9 @@ class GoogleAdsVideoSync:
             for row in result['response']:
                 self._process_row(row, stats, seen_keys, asset_map, 'appAd', 'youtubeVideos')
         
-        # Query APP_ENGAGEMENT_AD with DATE SEGMENT
+        # Query APP_ENGAGEMENT_AD (lifetime totals)
         query2 = """
             SELECT
-              segments.date,
               ad_group_ad.ad.app_engagement_ad.videos,
               ad_group_ad.ad.id,
               ad_group_ad.status,
@@ -223,7 +220,6 @@ class GoogleAdsVideoSync:
               metrics.interactions
             FROM ad_group_ad
             WHERE ad_group_ad.ad.type = 'APP_ENGAGEMENT_AD'
-              AND segments.date DURING LAST_30_DAYS
         """
         
         result2 = self.search(query2, customer_id)
@@ -234,7 +230,7 @@ class GoogleAdsVideoSync:
         return stats
 
     def _process_row(self, row, stats, seen_keys, asset_map, ad_key, video_key):
-        """Process row to extract ALL video stats with date"""
+        """Process row to extract ALL video stats (lifetime totals)"""
         try:
             ad_group_ad = row.get('adGroupAd', {})
             ad = ad_group_ad.get('ad', {})
@@ -242,10 +238,6 @@ class GoogleAdsVideoSync:
             metrics = row.get('metrics', {})
             customer = row.get('customer', {})
             ad_group = row.get('adGroup', {})
-            segments = row.get('segments', {})
-            
-            # Get the date from segments
-            report_date = segments.get('date', '')
             
             # Get statuses
             ad_status = ad_group_ad.get('status', 'UNKNOWN')
@@ -277,13 +269,10 @@ class GoogleAdsVideoSync:
                 
                 youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
                 
-                # Key now includes date for daily tracking
-                unique_key = f"{youtube_url}|{report_date}"
-                
-                if unique_key in seen_keys:
-                    # Aggregate metrics for same video on same date
+                if youtube_url in seen_keys:
+                    # Aggregate metrics for same video (from multiple accounts/ad groups)
                     for stat in stats:
-                        if stat['youtube_url'] == youtube_url and stat.get('date') == report_date:
+                        if stat['youtube_url'] == youtube_url:
                             stat['impressions'] += int(metrics.get('impressions', 0))
                             stat['clicks'] += int(metrics.get('clicks', 0))
                             stat['cost'] += float(metrics.get('costMicros', 0)) / 1000000.0
@@ -299,13 +288,12 @@ class GoogleAdsVideoSync:
                             break
                     continue
                 
-                seen_keys.add(unique_key)
+                seen_keys.add(youtube_url)
                 
-                # Status Handling - now includes date
+                # Add new video stats
                 stats.append({
                     'youtube_url': youtube_url,
                     'youtube_id': youtube_id,
-                    'date': report_date,  # NEW: Date field for daily data
                     'video_title': asset_info.get('youtube_title', ''),
                     
                     # Performance Metrics
@@ -544,10 +532,10 @@ class GoogleAdsVideoSync:
             )
         }
         
-        # Group by both youtube_url AND date for daily data
-        df_agg = df_ads.groupby(['youtube_url', 'date']).agg(agg_dict).reset_index()
+        # Group by youtube_url only for lifetime totals (one row per video)
+        df_agg = df_ads.groupby('youtube_url').agg(agg_dict).reset_index()
         
-        logger.info(f"📊 Aggregated to {len(df_agg)} video-date combinations (daily data)")
+        logger.info(f"📊 Aggregated to {len(df_agg)} unique videos (lifetime totals)")
         
         status_counts = df_agg['status'].value_counts().to_dict()
         logger.info(f"   Status: {status_counts}")
@@ -657,18 +645,14 @@ class GoogleAdsVideoSync:
             'account_id': 'google_ads_account_id',
             'status': 'google_ads_status',
             'approval_status': 'google_ads_approval_status',
-            'review_status': 'google_ads_review_status',
-            'date': 'google_ads_date'  # NEW: Date column for filtering
+            'review_status': 'google_ads_review_status'
         }
         
         df_upload = df_agg.rename(columns=rename_map)
         
         # Drop columns not in rename_map (like video_title, youtube_id which we don't need)
-        cols_to_keep = ['youtube_url', 'google_ads_date'] + [v for v in rename_map.values() if v != 'google_ads_date']
+        cols_to_keep = ['youtube_url'] + list(rename_map.values())
         df_upload = df_upload[[c for c in cols_to_keep if c in df_upload.columns]]
-        
-        # Convert date column to proper datetime for BigQuery DATE type
-        df_upload['google_ads_date'] = pd.to_datetime(df_upload['google_ads_date']).dt.date
         
         # Upload to temp table then MERGE
         logger.info("💾 Uploading to temp table...")
@@ -684,20 +668,17 @@ class GoogleAdsVideoSync:
         # Build dynamic SET clause from column names
         set_clauses = []
         for col in df_upload.columns:
-            if col not in ['youtube_url', 'google_ads_date']:
+            if col != 'youtube_url':
                 set_clauses.append(f"T.{col} = S.{col}")
         set_clauses.append("T.google_ads_last_sync = CURRENT_TIMESTAMP()")
         
-        # MERGE on both youtube_url AND date for daily data
+        # MERGE on youtube_url only (lifetime totals)
         merge_query = f"""
             MERGE `{self.full_table_id}` T
             USING `{temp_table_id}` S
-            ON T.youtube_url = S.youtube_url AND T.google_ads_date = S.google_ads_date
+            ON T.youtube_url = S.youtube_url
             WHEN MATCHED THEN
                 UPDATE SET {', '.join(set_clauses)}
-            WHEN NOT MATCHED BY TARGET THEN
-                INSERT (youtube_url, google_ads_date, {', '.join([c for c in df_upload.columns if c not in ['youtube_url', 'google_ads_date']])}, google_ads_last_sync)
-                VALUES (S.youtube_url, S.google_ads_date, {', '.join(['S.' + c for c in df_upload.columns if c not in ['youtube_url', 'google_ads_date']])}, CURRENT_TIMESTAMP())
         """
         
         self.bq_client.query(merge_query).result()
@@ -714,7 +695,7 @@ class GoogleAdsVideoSync:
         """
         self.bq_client.query(pending_query).result()
         
-        logger.info(f"✓ Updated {len(df_agg)} video-date records with Google Ads data")
+        logger.info(f"✓ Updated {len(df_agg)} unique videos with Google Ads data")
         logger.info("✓ Videos not in Google Ads marked as PENDING")
         logger.info("=" * 50)
         logger.info("✅ Google Ads Sync Complete!")
