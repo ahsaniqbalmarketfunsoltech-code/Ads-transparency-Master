@@ -647,6 +647,9 @@ class GoogleAdsVideoSync:
         cols_to_keep = ['youtube_url', 'google_ads_date'] + [v for v in rename_map.values() if v != 'google_ads_date']
         df_upload = df_upload[[c for c in cols_to_keep if c in df_upload.columns]]
         
+        # Convert date column to proper datetime for BigQuery DATE type
+        df_upload['google_ads_date'] = pd.to_datetime(df_upload['google_ads_date']).dt.date
+        
         # Upload to temp table then MERGE
         logger.info("💾 Uploading to temp table...")
         
