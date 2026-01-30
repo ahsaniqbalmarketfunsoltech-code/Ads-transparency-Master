@@ -404,6 +404,7 @@ class GoogleAdsVideoSync:
             # Decimals (No $ sign, plain decimal like 0.02)
             ("google_ads_avg_cpc", "STRING"),
             ("google_ads_avg_cpm", "STRING"),
+            ("google_ads_cvc", "STRING"),  # NEW: Conversion Value / Cost
             ("google_ads_conversions", "STRING"),
             ("google_ads_all_conversions", "STRING"),
             
@@ -551,6 +552,22 @@ class GoogleAdsVideoSync:
         status_counts = df_agg['status'].value_counts().to_dict()
         logger.info(f"   Status: {status_counts}")
         
+        # Calculate CVC (Conversion Value / Cost) BEFORE formatting
+        # This gives the return on ad spend ratio
+        def calculate_cvc(row):
+            try:
+                cost = float(row['cost'])
+                conv_value = float(row['conversions_value'])
+                if cost > 0:
+                    return conv_value / cost
+                else:
+                    return 0.0
+            except:
+                return 0.0
+        
+        df_agg['cvc'] = df_agg.apply(calculate_cvc, axis=1)
+        logger.info("✓ Calculated CVC (Conversion Value / Cost)")
+        
         # Format numbers with currency signs and percentages for better readability
         def format_number(val):
             """Format number with commas (e.g., 1,234,567)"""
@@ -599,8 +616,10 @@ class GoogleAdsVideoSync:
         df_agg['video_50_rate'] = df_agg['video_50_rate'].apply(format_percentage)
         df_agg['video_75_rate'] = df_agg['video_75_rate'].apply(format_percentage)
         df_agg['video_100_rate'] = df_agg['video_100_rate'].apply(format_percentage)
+        # Format CVC as decimal (e.g., 2.45 means $2.45 return per $1 spent)
+        df_agg['cvc'] = df_agg['cvc'].apply(format_decimal)
         
-        logger.info("✓ Applied formatting (Plain decimals for CPC/CPM, $ for costs, % for rates)")
+        logger.info("✓ Applied formatting (Plain decimals for CPC/CPM/CVC, $ for costs, % for rates)")
         
         # Prepare for upload - rename columns with google_ads_ prefix
         rename_map = {
@@ -615,6 +634,7 @@ class GoogleAdsVideoSync:
             'ctr': 'google_ads_ctr',
             'avg_cpc': 'google_ads_avg_cpc',
             'avg_cpm': 'google_ads_avg_cpm',
+            'cvc': 'google_ads_cvc',  # NEW: Conversion Value / Cost
             'video_25_rate': 'google_ads_video_25_rate',
             'video_50_rate': 'google_ads_video_50_rate',
             'video_75_rate': 'google_ads_video_75_rate',
