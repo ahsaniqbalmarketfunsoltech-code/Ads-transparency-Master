@@ -239,6 +239,11 @@ class GoogleAdsVideoSync:
             customer = row.get('customer', {})
             ad_group = row.get('adGroup', {})
             
+            # DEBUG: Log ad_id and metrics to check for duplicates
+            ad_id = ad.get('id', 'unknown')
+            cost_micros = metrics.get('costMicros', 0)
+            logger.debug(f"Ad {ad_id}: cost_micros={cost_micros}, conversionsValue={metrics.get('conversionsValue', 0)}")
+            
             # Get statuses
             ad_status = ad_group_ad.get('status', 'UNKNOWN')
             ag_status = ad_group.get('status', 'UNKNOWN')
@@ -539,6 +544,12 @@ class GoogleAdsVideoSync:
         
         status_counts = df_agg['status'].value_counts().to_dict()
         logger.info(f"   Status: {status_counts}")
+        
+        # DEBUG: Show distribution of cost values to check for duplicates
+        cost_value_counts = df_agg['cost'].value_counts().head(10)
+        logger.info(f"   DEBUG - Top 10 most common cost values:")
+        for cost_val, count in cost_value_counts.items():
+            logger.info(f"      ${cost_val:.2f} appears {count} times")
         
         # Calculate CVC (Conversion Value / Cost) BEFORE formatting
         # This gives the return on ad spend ratio
