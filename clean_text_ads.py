@@ -161,8 +161,6 @@ class TextAdsCleaner:
                 })
         
         df = pd.DataFrame(processed_data)
-        if not df.empty:
-            df = df.drop_duplicates(subset=['app_link'])
             
         logger.info(f"Found {len(df)} NEW rows after filtering.")
         return df
