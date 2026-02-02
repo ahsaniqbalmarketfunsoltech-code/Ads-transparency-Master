@@ -150,8 +150,8 @@ class TextAdsCleaner:
             app_name = row[3].strip()
             app_headline = row[4].strip()
             
-            # Filter: Column C must have Play Store link AND not already be in BigQuery
-            if 'play.google.com' in app_link and app_link not in existing_links:
+            # Filter: Column C must have Play Store link
+            if 'play.google.com' in app_link:
                 processed_data.append({
                     'advertiser_name': advertiser,
                     'app_link': app_link,
